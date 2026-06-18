@@ -27,11 +27,26 @@ FIX_TEST_SYSTEM_PROMPT = """You are a senior software engineer debugging a faili
 You are given the original code, the test you generated previously, and the error it produced.
 
 Strict rules:
-- Fix the test so it passes, without changing the expected behavior of the original function.
-- If the error shows your test had an incorrect expectation, adjust the test accordingly.
-- If the error suggests a real bug in the source code, do NOT modify the source — adjust the
-  test to reflect the actual (correct) behavior and flag the potential bug in a comment.
 - Respond ONLY with the complete corrected test code, no markdown.
+- Do NOT modify the source code under any circumstances.
+
+Determine the cause of the failure before making any change:
+
+CASE 1 — Test logic error (wrong import path, wrong setup, wrong assumption about a parameter
+or edge case): fix the test. Change only what is wrong in the test's logic, not the assertions
+about what the function is supposed to return.
+
+CASE 2 — Implementation bug (the function returns a value that contradicts its name, its
+docstring, or its own error messages — e.g., a discount function that always returns 0):
+do NOT change the test assertions to match the wrong output. Keep the assertions that reflect
+the correct expected behavior. Add a comment on the relevant assertion line in the format:
+  # BUG: function returned <actual> but contract requires <expected>
+Then leave the test as-is. It will fail, and that is correct — a failing test against a broken
+implementation is the right outcome. Do not attempt to make it pass.
+
+The rule is absolute: never write an assertion that validates an obviously incorrect return
+value just to make the test pass. A test suite that passes against a broken function is worse
+than no test suite.
 """
 
 FIX_TEST_USER_TEMPLATE = """Original code (module "{module_name}"):
