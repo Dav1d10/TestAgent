@@ -8,6 +8,8 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.coverage
+*.stackdump
 
 # Docker
 *.log
@@ -20,4 +22,3 @@ CLAUDE.md
 AGENTS.md
 ImplementationPlan.md
 /skills
-bash.exe.stackdump
