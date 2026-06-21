@@ -11,8 +11,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from dotenv import load_dotenv
-load_dotenv()
+import app.config  # noqa: F401 — triggers load_dotenv() before OpenAI() is instantiated
 
 from app.agent.graph import build_agent_graph
 from app.agent.state import create_initial_state
