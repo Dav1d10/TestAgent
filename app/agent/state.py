@@ -13,6 +13,8 @@ class AgentState(TypedDict):
     # Input: what the agent receives at startup
     source_code: str        # the function/code that needs tests
     module_name: str        # filename stem given to the module (no .py extension)
+    target_function: Optional[str]  # name of the specific function to test within source_code
+                                     # (None means "test the file as a whole", used by Stages 1-3)
 
     # Generated during the flow
     test_code: Optional[str]        # the test produced by the LLM
@@ -33,11 +35,13 @@ def create_initial_state(
     source_code: str,
     module_name: str = "target_module",
     max_attempts: int = 3,
+    target_function: Optional[str] = None,
 ) -> AgentState:
     """Returns the initial state to start the graph with a new function."""
     return AgentState(
         source_code=source_code,
         module_name=module_name,
+        target_function=target_function,
         test_code=None,
         test_passed=None,
         test_stdout=None,

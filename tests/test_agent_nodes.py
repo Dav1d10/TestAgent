@@ -59,6 +59,18 @@ class TestGenerateTestNode:
         result = generate_test_node(_state())
         assert "```" not in result["test_code"]
 
+    def test_targeted_prompt_names_the_function(self, mocker):
+        llm_call = mocker.patch("app.agent.nodes._call_llm", return_value="def test_add(): pass")
+        generate_test_node(_state(target_function="add"))
+        _, user_prompt = llm_call.call_args[0]
+        assert "ONLY for `add`" in user_prompt
+
+    def test_untargeted_prompt_omits_function_name(self, mocker):
+        llm_call = mocker.patch("app.agent.nodes._call_llm", return_value="def test_add(): pass")
+        generate_test_node(_state(target_function=None))
+        _, user_prompt = llm_call.call_args[0]
+        assert "ONLY for" not in user_prompt
+
 
 # ── run_test_node ─────────────────────────────────────────────────────────────
 
@@ -129,6 +141,12 @@ class TestFixTestNode:
         _, user_prompt = llm_call.call_args[0]
         # Should not raise; error_output defaults to ""
         assert user_prompt is not None
+
+    def test_targeted_prompt_names_the_function(self, mocker):
+        llm_call = mocker.patch("app.agent.nodes._call_llm", return_value="def test_fixed(): pass")
+        fix_test_node(self._failing_state(target_function="add"))
+        _, user_prompt = llm_call.call_args[0]
+        assert "targets" in user_prompt and "`add`" in user_prompt
 
 
 # ── finalize_node ─────────────────────────────────────────────────────────────

@@ -47,6 +47,7 @@ def generate_test_node(state: AgentState) -> dict:
     system, user = build_generate_test_prompt(
         source_code=state["source_code"],
         module_name=state["module_name"],
+        target_function=state.get("target_function"),
     )
     raw = _call_llm(system, user)
     test_code = _strip_markdown_fences(raw)
@@ -84,6 +85,7 @@ def fix_test_node(state: AgentState) -> dict:
         module_name=state["module_name"],
         test_code=state["test_code"],
         error_output=error_output,
+        target_function=state.get("target_function"),
     )
     raw = _call_llm(system, user)
     fixed_test_code = _strip_markdown_fences(raw)

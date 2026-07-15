@@ -3,6 +3,8 @@ Agent prompts. Kept separate from graph logic because these are the most
 frequently iterated piece — tuning prompts should never require touching node code.
 """
 
+from typing import Optional
+
 GENERATE_TEST_SYSTEM_PROMPT = """You are a senior software engineer specialized in testing.
 Your only task is to generate pytest unit tests for the code provided to you.
 
@@ -17,6 +19,16 @@ Strict rules:
 
 GENERATE_TEST_USER_TEMPLATE = """Generate complete unit tests for the following code.
 The module is named "{module_name}".
+
+```python
+{source_code}
+```
+"""
+
+GENERATE_TEST_USER_TEMPLATE_TARGETED = """The module below is named "{module_name}" and contains more than
+one function. Generate complete unit tests ONLY for `{target_function}`. The rest of the module is provided
+so you can see any helper functions or dependencies `{target_function}` relies on — do not write tests for
+those other functions.
 
 ```python
 {source_code}
@@ -66,25 +78,58 @@ Error produced:
 
 Fix the test."""
 
+FIX_TEST_USER_TEMPLATE_TARGETED = """Original code (module "{module_name}"). The test below targets
+`{target_function}` specifically — the rest of the module is shown only for context:
+```python
+{source_code}
+```
 
-def build_generate_test_prompt(source_code: str, module_name: str) -> tuple[str, str]:
+Failing test:
+```python
+{test_code}
+```
+
+Error produced:
+```
+{error_output}
+```
+
+Fix the test."""
+
+
+def build_generate_test_prompt(
+    source_code: str, module_name: str, target_function: Optional[str] = None
+) -> tuple[str, str]:
     """Returns (system_prompt, user_prompt) for initial test generation."""
     system = GENERATE_TEST_SYSTEM_PROMPT.format(module_name=module_name)
-    user = GENERATE_TEST_USER_TEMPLATE.format(
-        module_name=module_name, source_code=source_code
-    )
+    if target_function:
+        user = GENERATE_TEST_USER_TEMPLATE_TARGETED.format(
+            module_name=module_name,
+            source_code=source_code,
+            target_function=target_function,
+        )
+    else:
+        user = GENERATE_TEST_USER_TEMPLATE.format(
+            module_name=module_name, source_code=source_code
+        )
     return system, user
 
 
 def build_fix_test_prompt(
-    source_code: str, module_name: str, test_code: str, error_output: str
+    source_code: str,
+    module_name: str,
+    test_code: str,
+    error_output: str,
+    target_function: Optional[str] = None,
 ) -> tuple[str, str]:
     """Returns (system_prompt, user_prompt) for a self-correction attempt."""
     system = FIX_TEST_SYSTEM_PROMPT
-    user = FIX_TEST_USER_TEMPLATE.format(
+    template = FIX_TEST_USER_TEMPLATE_TARGETED if target_function else FIX_TEST_USER_TEMPLATE
+    user = template.format(
         module_name=module_name,
         source_code=source_code,
         test_code=test_code,
         error_output=error_output,
+        target_function=target_function,
     )
     return system, user

@@ -10,14 +10,22 @@ import hmac
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+from unidiff import PatchSet
 
 from app.agent.graph import build_agent_graph
 from app.agent.state import create_initial_state
 from app.config import GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET
-from app.tools.github_client import get_file_content
+from app.tools.code_parser import extract_modified_functions
+from app.tools.github_client import (
+    create_pr,
+    file_exists,
+    get_file_content,
+    get_push_diff,
+    post_commit_comment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,43 +67,104 @@ def _extract_python_files(payload: Dict[str, Any]) -> List[Dict[str, str]]:
     return results
 
 
-def _process_push_event(files: List[Dict[str, str]]) -> None:
+def _test_file_path(module_name: str) -> str:
+    return f"tests/test_{module_name}.py"
+
+
+def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) -> None:
     """
-    Background task: fetch source for each file and run the agent cycle.
+    Background task: for each touched file, diff-parse the modified functions and
+    run one agent cycle per function. Successes are batched into a single PR;
+    if nothing succeeded but something failed, a comment is posted on the commit.
     Runs synchronously in a thread pool (Starlette's BackgroundTasks calls
     run_in_threadpool for sync functions, so this does not block the event loop).
-
-    Stage 4 will replace the logger.info call with PR creation on success
-    and a PR comment on failed_max_attempts.
     """
-    for file_info in files:
-        try:
-            source_code = get_file_content(
-                repo=file_info["repo"],
-                path=file_info["path"],
-                ref=file_info["ref"],
-                token=GITHUB_TOKEN,
-            )
-        except Exception as exc:
-            logger.error("Failed to fetch %s: %s", file_info["path"], exc)
+    repo = payload["repository"]["full_name"]
+    base = payload["before"]
+    head = payload["after"]
+    wanted_paths = {f["path"] for f in files}
+
+    try:
+        diff_text = get_push_diff(repo=repo, base=base, head=head, token=GITHUB_TOKEN)
+        patch_set = PatchSet(diff_text)
+    except Exception as exc:
+        logger.error("Failed to fetch/parse push diff for %s (%s...%s): %s", repo, base, head, exc)
+        return
+
+    successes: List[Tuple[str, str]] = []  # (path in new branch, test code)
+    failures: List[str] = []  # "module::function" labels
+
+    for patched_file in patch_set:
+        path = patched_file.path
+        if path not in wanted_paths:
             continue
 
-        module_name = Path(file_info["path"]).stem
-        initial_state = create_initial_state(source_code, module_name=module_name)
-
         try:
-            final_state = _agent.invoke(initial_state)
+            source_code = get_file_content(repo=repo, path=path, ref=head, token=GITHUB_TOKEN)
+        except Exception as exc:
+            logger.error("Failed to fetch %s: %s", path, exc)
+            continue
+
+        module_name = Path(path).stem
+        functions = extract_modified_functions(patched_file, source_code)
+
+        if functions and file_exists(repo, _test_file_path(module_name), head, GITHUB_TOKEN):
+            logger.info("Skipping %s — %s already exists", path, _test_file_path(module_name))
+            continue
+
+        for fn in functions:
+            initial_state = create_initial_state(
+                source_code, module_name=module_name, target_function=fn.name
+            )
+            try:
+                final_state = _agent.invoke(initial_state)
+            except Exception as exc:
+                logger.error("Agent failed for %s::%s: %s", path, fn.name, exc)
+                failures.append(f"{module_name}::{fn.name}")
+                continue
+
             logger.info(
-                "Agent completed %s — status: %s, attempts: %d/%d",
-                file_info["path"],
+                "Agent completed %s::%s — status: %s, attempts: %d/%d",
+                path,
+                fn.name,
                 final_state["final_status"],
                 final_state["attempt_count"],
                 final_state["max_attempts"],
             )
-            # Stage 4: if final_state["final_status"] == "success" → open PR
-            # Stage 4: if "failed_max_attempts" → post comment on triggering commit
+            if final_state["final_status"] == "success":
+                successes.append((f"tests/test_{module_name}_{fn.name}.py", final_state["test_code"]))
+            else:
+                failures.append(f"{module_name}::{fn.name}")
+
+    if successes:
+        branch = f"test-agent/push/{head[:7]}"
+        tested = ", ".join(path.split("/")[-1] for path, _ in successes)
+        body = f"Auto-generated tests for: {tested}"
+        if failures:
+            body += "\n\nFunctions that did not converge within max_attempts: " + ", ".join(failures)
+        try:
+            pr_url = create_pr(
+                repo=repo,
+                branch=branch,
+                title=f"TestAgent: generated tests for push {head[:7]}",
+                body=body,
+                files=successes,
+                token=GITHUB_TOKEN,
+            )
+            logger.info("Opened PR: %s", pr_url)
         except Exception as exc:
-            logger.error("Agent failed for %s: %s", file_info["path"], exc)
+            logger.error("Failed to create PR for %s: %s", repo, exc)
+    elif failures:
+        try:
+            post_commit_comment(
+                repo=repo,
+                sha=head,
+                body="TestAgent could not generate a passing test within max_attempts for: "
+                + ", ".join(failures),
+                token=GITHUB_TOKEN,
+            )
+        except Exception as exc:
+            logger.error("Failed to post commit comment on %s@%s: %s", repo, head, exc)
 
 
 @router.post("/github")
@@ -117,5 +186,5 @@ async def github_webhook(
     if not files:
         return {"status": "no_python_files"}
 
-    background_tasks.add_task(_process_push_event, files)
+    background_tasks.add_task(_process_push_event, payload, files)
     return {"status": "accepted", "files_queued": len(files)}

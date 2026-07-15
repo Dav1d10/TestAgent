@@ -6,9 +6,12 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
+from unidiff import PatchSet
 
 from app.main import app
-from app.webhooks.github_webhook import _extract_python_files
+import app.webhooks.github_webhook as webhook_module
+from app.webhooks.github_webhook import _extract_python_files, _process_push_event
+from app.tools.code_parser import FunctionInfo
 
 TEST_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "test-webhook-secret")
 
@@ -36,6 +39,7 @@ def _post(payload: dict, event: str = "push", secret: str = TEST_SECRET, bad_sig
 
 PUSH_PAYLOAD = {
     "repository": {"full_name": "user/repo"},
+    "before": "def456",
     "after": "abc123",
     "commits": [
         {
@@ -165,3 +169,93 @@ class TestExtractPythonFiles:
             "commits": [],
         }
         assert _extract_python_files(payload) == []
+
+
+# ── _process_push_event (Stage 4 orchestration) ────────────────────────────────
+
+UTILS_DIFF = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,2 +1,3 @@
+ def add(a, b):
++    # comment
+     return a + b
+"""
+
+FILES = [{"repo": "user/repo", "path": "app/utils.py", "ref": "abc123"}]
+ONE_FUNCTION = [FunctionInfo(name="add", source="def add(a, b):\n    return a + b", file_path="app/utils.py", line_start=1, line_end=2)]
+
+
+class TestProcessPushEvent:
+    def _mocks(self, mocker, functions=ONE_FUNCTION, file_exists=False):
+        mocker.patch("app.webhooks.github_webhook.get_push_diff", return_value=UTILS_DIFF)
+        mocker.patch("app.webhooks.github_webhook.get_file_content", return_value="def add(a, b):\n    return a + b\n")
+        mocker.patch("app.webhooks.github_webhook.extract_modified_functions", return_value=functions)
+        mocker.patch("app.webhooks.github_webhook.file_exists", return_value=file_exists)
+        return (
+            mocker.patch("app.webhooks.github_webhook.create_pr"),
+            mocker.patch("app.webhooks.github_webhook.post_commit_comment"),
+        )
+
+    def test_success_opens_a_pr_with_generated_test(self, mocker):
+        create_pr_mock, post_comment_mock = self._mocks(mocker)
+        mocker.patch.object(
+            webhook_module._agent,
+            "invoke",
+            return_value={
+                "final_status": "success",
+                "test_code": "def test_add(): assert add(1, 2) == 3",
+                "attempt_count": 1,
+                "max_attempts": 3,
+            },
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_called_once()
+        assert create_pr_mock.call_args.kwargs["files"] == [
+            ("tests/test_utils_add.py", "def test_add(): assert add(1, 2) == 3")
+        ]
+        post_comment_mock.assert_not_called()
+
+    def test_failure_posts_a_commit_comment_not_a_pr(self, mocker):
+        create_pr_mock, post_comment_mock = self._mocks(mocker)
+        mocker.patch.object(
+            webhook_module._agent,
+            "invoke",
+            return_value={
+                "final_status": "failed_max_attempts",
+                "test_code": "def test_add(): assert add(1, 2) == 99",
+                "attempt_count": 3,
+                "max_attempts": 3,
+            },
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        post_comment_mock.assert_called_once()
+        assert "utils::add" in post_comment_mock.call_args.kwargs["body"]
+
+    def test_skips_function_when_test_file_already_exists(self, mocker):
+        create_pr_mock, post_comment_mock = self._mocks(mocker, file_exists=True)
+        agent_invoke = mocker.patch.object(
+            webhook_module._agent, "invoke"
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        agent_invoke.assert_not_called()
+        create_pr_mock.assert_not_called()
+        post_comment_mock.assert_not_called()
+
+    def test_no_modified_functions_does_nothing(self, mocker):
+        create_pr_mock, post_comment_mock = self._mocks(mocker, functions=[])
+        agent_invoke = mocker.patch.object(
+            webhook_module._agent, "invoke"
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        agent_invoke.assert_not_called()
+        create_pr_mock.assert_not_called()
+        post_comment_mock.assert_not_called()
