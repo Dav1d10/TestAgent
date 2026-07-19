@@ -86,6 +86,9 @@ class TestCreatePr:
                 return _FakeResponse(json_data={"default_branch": "main"})
             if "git/ref/heads/main" in url:
                 return _FakeResponse(json_data={"object": {"sha": "base_sha"}})
+            if "/contents/" in url:
+                # Existence check before PUT — 404 means a new file (no sha needed).
+                return _FakeResponse(status_code=404)
             raise AssertionError(f"unexpected GET {url}")
 
         mock_client.get.side_effect = get_side_effect
@@ -121,3 +124,36 @@ class TestCreatePr:
         open_pr_call = mock_client.post.call_args_list[1]
         assert open_pr_call.kwargs["json"]["head"] == "test-agent/push/abc1234"
         assert open_pr_call.kwargs["json"]["base"] == "main"
+
+    def test_updates_existing_file_includes_sha(self, mocker):
+        mock_client = mocker.MagicMock()
+
+        def get_side_effect(url, **kwargs):
+            if url.endswith("/repos/owner/repo"):
+                return _FakeResponse(json_data={"default_branch": "main"})
+            if "git/ref/heads/main" in url:
+                return _FakeResponse(json_data={"object": {"sha": "base_sha"}})
+            if "/contents/" in url:
+                # File already exists on the branch → its blob sha must go in the PUT.
+                return _FakeResponse(json_data={"sha": "existing_blob_sha"}, status_code=200)
+            raise AssertionError(f"unexpected GET {url}")
+
+        mock_client.get.side_effect = get_side_effect
+        mock_client.post.side_effect = [
+            _FakeResponse(),  # create ref
+            _FakeResponse(json_data={"html_url": "https://github.com/owner/repo/pull/2"}),
+        ]
+        mock_client.put.return_value = _FakeResponse()
+        mocker.patch("httpx.Client").return_value.__enter__.return_value = mock_client
+
+        github_client.create_pr(
+            repo="owner/repo",
+            branch="test-agent/push/abc1234",
+            title="t",
+            body="b",
+            files=[("tests/test_x.py", "def test_x(): pass")],
+            token="tok",
+        )
+
+        put_call = mock_client.put.call_args
+        assert put_call.kwargs["json"]["sha"] == "existing_blob_sha"

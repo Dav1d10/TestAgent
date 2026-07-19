@@ -54,6 +54,16 @@ def file_exists(repo: str, path: str, ref: str, token: str) -> bool:
         raise
 
 
+def get_file_content_or_empty(repo: str, path: str, ref: str, token: str) -> str:
+    """Like get_file_content, but returns "" when the file does not exist (404)."""
+    try:
+        return get_file_content(repo=repo, path=path, ref=ref, token=token)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return ""
+        raise
+
+
 def get_push_diff(repo: str, base: str, head: str, token: str) -> str:
     """
     Fetch the cumulative unified diff for an entire push (which may span several
@@ -138,14 +148,28 @@ def create_pr(
         create_ref_resp.raise_for_status()
 
         for path, content in files:
+            # A module's test file may already exist (a prior TestAgent PR was merged).
+            # The Contents API rejects an update PUT without the current blob sha, so
+            # look it up on the new branch and include it when present.
+            body_json = {
+                "message": f"Add or update generated test for {path}",
+                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                "branch": branch,
+            }
+            existing = client.get(
+                f"{_API}/repos/{repo}/contents/{path}",
+                headers=headers,
+                params={"ref": branch},
+            )
+            if existing.status_code == 200:
+                body_json["sha"] = existing.json()["sha"]
+            elif existing.status_code != 404:
+                existing.raise_for_status()
+
             put_resp = client.put(
                 f"{_API}/repos/{repo}/contents/{path}",
                 headers=headers,
-                json={
-                    "message": f"Add generated test for {path}",
-                    "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-                    "branch": branch,
-                },
+                json=body_json,
             )
             put_resp.raise_for_status()
 

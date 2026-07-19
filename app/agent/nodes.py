@@ -8,6 +8,7 @@ from openai import OpenAI
 from app.agent.state import AgentState
 from app.agent.prompts import build_generate_test_prompt, build_fix_test_prompt
 from app.tools.sandbox import run_test_in_sandbox
+from app.tools.test_merger import merge_test_block, top_level_function_names
 
 client = OpenAI()
 
@@ -42,27 +43,47 @@ def _strip_markdown_fences(code: str) -> str:
     return "\n".join(lines)
 
 
+def _merge_for_run(state: AgentState, block: str) -> str:
+    """
+    Merge the LLM's block into the module's existing test file (targeted mode),
+    or return it unchanged (whole-file mode). This is what actually runs in the
+    sandbox and, on success, becomes the PR file.
+    """
+    target = state.get("target_function")
+    if not target:
+        return block
+    return merge_test_block(
+        existing_content=state.get("existing_test_file", ""),
+        function_name=target,
+        new_block=block,
+        all_function_names=top_level_function_names(state["source_code"]),
+    )
+
+
 def generate_test_node(state: AgentState) -> dict:
-    """First node: generates the initial test from the source code."""
+    """First node: generates the initial test (block or whole file) from the source."""
     system, user = build_generate_test_prompt(
         source_code=state["source_code"],
         module_name=state["module_name"],
         target_function=state.get("target_function"),
+        existing_test_file=state.get("existing_test_file", ""),
     )
     raw = _call_llm(system, user)
     test_code = _strip_markdown_fences(raw)
 
     return {
         "test_code": test_code,
+        "merged_test_code": _merge_for_run(state, test_code),
         "attempt_count": state["attempt_count"] + 1,
     }
 
 
 def run_test_node(state: AgentState) -> dict:
-    """Runs the current test (initial or corrected) inside the sandbox."""
+    """Runs the current merged test file inside the sandbox."""
+    test_to_run = state.get("merged_test_code") or state["test_code"]
     result = run_test_in_sandbox(
         source_code=state["source_code"],
-        test_code=state["test_code"],
+        test_code=test_to_run,
         module_name=state["module_name"],
     )
 
@@ -76,8 +97,9 @@ def run_test_node(state: AgentState) -> dict:
 def fix_test_node(state: AgentState) -> dict:
     """
     Runs when the previous test failed and attempts remain.
-    Passes the real error output to the LLM so it can correct the test,
-    not the source code.
+    In targeted mode the LLM sees the full merged file (to diagnose interactions)
+    but returns only the corrected block, which is re-merged into the baseline.
+    Never modifies the source code.
     """
     error_output = state["test_stderr"] or state["test_stdout"] or ""
     system, user = build_fix_test_prompt(
@@ -86,12 +108,14 @@ def fix_test_node(state: AgentState) -> dict:
         test_code=state["test_code"],
         error_output=error_output,
         target_function=state.get("target_function"),
+        merged_test_code=state.get("merged_test_code"),
     )
     raw = _call_llm(system, user)
-    fixed_test_code = _strip_markdown_fences(raw)
+    fixed_block = _strip_markdown_fences(raw)
 
     return {
-        "test_code": fixed_test_code,
+        "test_code": fixed_block,
+        "merged_test_code": _merge_for_run(state, fixed_block),
         "attempt_count": state["attempt_count"] + 1,
     }
 
