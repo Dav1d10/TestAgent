@@ -12,6 +12,7 @@ from app.main import app
 import app.webhooks.github_webhook as webhook_module
 from app.webhooks.github_webhook import _extract_python_files, _process_push_event, _safe_module_name
 from app.tools.code_parser import FunctionInfo
+from app.tools.sandbox import SandboxResult
 
 TEST_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "test-webhook-secret")
 
@@ -162,6 +163,25 @@ class TestExtractPythonFiles:
         files = _extract_python_files(payload)
         assert len(files) == 1
 
+    def test_includes_removed_python_file_with_final_status(self):
+        payload = {
+            "repository": {"full_name": "user/repo"},
+            "after": "abc123",
+            "commits": [
+                {"modified": ["app/removed.py"], "added": [], "removed": []},
+                {"modified": [], "added": [], "removed": ["app/removed.py"]},
+            ],
+        }
+        files = _extract_python_files(payload)
+        assert files == [
+            {
+                "repo": "user/repo",
+                "path": "app/removed.py",
+                "ref": "abc123",
+                "deleted": True,
+            }
+        ]
+
     def test_empty_commits_returns_empty(self):
         payload = {
             "repository": {"full_name": "user/repo"},
@@ -235,14 +255,16 @@ class TestProcessPushEvent:
             webhook_module._agent,
             "invoke",
             return_value=_final("success", "def test_add_ok(): assert add() is None",
-                                merged_test_code="MERGED_FILE"),
+                                merged_test_code="def test_add_ok():\n    assert add() is None\n"),
         )
 
         _process_push_event(PUSH_PAYLOAD, FILES)
 
         create_pr_mock.assert_called_once()
         # The PR carries the module test file with the merged content — one file per module.
-        assert create_pr_mock.call_args.kwargs["files"] == [("tests/test_utils.py", "MERGED_FILE")]
+        assert create_pr_mock.call_args.kwargs["files"] == [
+            ("tests/test_utils.py", "def test_add_ok():\n    assert add() is None\n")
+        ]
         post_comment_mock.assert_not_called()
 
     def test_broken_function_posts_bug_comment_not_pr(self, mocker):
@@ -281,7 +303,11 @@ class TestProcessPushEvent:
             webhook_module._agent,
             "invoke",
             side_effect=[
-                _final("success", "def test_add_ok(): assert add() is None", merged_test_code="MERGED_ADD"),
+                _final(
+                    "success",
+                    "def test_add_ok(): assert add() is None",
+                    merged_test_code="def test_add_ok():\n    assert add() is None\n",
+                ),
                 _final("failed_max_attempts", broken),
             ],
         )
@@ -290,7 +316,9 @@ class TestProcessPushEvent:
 
         # PR is opened with only the green function's merged file...
         create_pr_mock.assert_called_once()
-        assert create_pr_mock.call_args.kwargs["files"] == [("tests/test_utils.py", "MERGED_ADD")]
+        assert create_pr_mock.call_args.kwargs["files"] == [
+            ("tests/test_utils.py", "def test_add_ok():\n    assert add() is None\n")
+        ]
         # ...and the broken function gets its own commit comment.
         post_comment_mock.assert_called_once()
         assert "is_prime" in post_comment_mock.call_args.kwargs["body"]
@@ -303,4 +331,204 @@ class TestProcessPushEvent:
 
         agent_invoke.assert_not_called()
         create_pr_mock.assert_not_called()
+        post_comment_mock.assert_not_called()
+
+    def _deletion_mocks(self, mocker, old_source, new_source, baseline, diff_text):
+        mocker.patch("app.webhooks.github_webhook.get_push_diff", return_value=diff_text)
+        mocker.patch("app.webhooks.github_webhook.get_file_content", return_value=new_source)
+        mocker.patch(
+            "app.webhooks.github_webhook.get_file_content_or_empty",
+            side_effect=[old_source, baseline],
+        )
+        mocker.patch("app.webhooks.github_webhook.extract_modified_functions", return_value=[])
+        sandbox = mocker.patch(
+            "app.webhooks.github_webhook.run_test_in_sandbox",
+            return_value=SandboxResult(True, "1 passed", "", 0),
+        )
+        return (
+            mocker.patch("app.webhooks.github_webhook.create_pr"),
+            mocker.patch("app.webhooks.github_webhook.post_commit_comment"),
+            sandbox,
+        )
+
+    def test_deleted_function_removes_owned_tests_and_import(self, mocker):
+        old_source = "def removed():\n    return 1\n\ndef current():\n    return 2\n"
+        new_source = "def current():\n    return 2\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,5 +1,2 @@
+-def removed():
+-    return 1
+-
+ def current():
+     return 2
+"""
+        baseline = (
+            "from utils import removed\n"
+            "from utils import current\n\n"
+            "def test_removed_basic():\n    assert removed() == 1\n\n"
+            "def test_current_basic():\n    assert current() == 2\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+        agent_invoke = mocker.patch.object(webhook_module._agent, "invoke")
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        agent_invoke.assert_not_called()
+        sandbox.assert_called_once()
+        cleaned = create_pr_mock.call_args.kwargs["files"][0][1]
+        assert "removed" not in cleaned
+        assert "test_current_basic" in cleaned
+        assert create_pr_mock.call_args.kwargs["deleted_files"] == []
+        post_comment_mock.assert_not_called()
+
+    def test_reconciles_orphan_left_by_missed_deletion_webhook(self, mocker):
+        source = "def current():\n    # touched later\n    return 2\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,2 +1,3 @@
+ def current():
++    # touched later
+     return 2
+"""
+        baseline = (
+            "from utils import removed\n"
+            "from utils import current\n\n"
+            "def test_removed_basic():\n    assert removed() == 1\n\n"
+            "def test_current_basic():\n    assert current() == 2\n"
+        )
+        create_pr_mock, _, _ = self._deletion_mocks(
+            mocker, source, source, baseline, diff_text
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        cleaned = create_pr_mock.call_args.kwargs["files"][0][1]
+        assert "removed" not in cleaned
+        assert "test_current_basic" in cleaned
+
+    def test_deleting_last_owned_tests_deletes_test_file(self, mocker):
+        old_source = "def removed():\n    return 1\n"
+        new_source = ""
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,2 +0,0 @@
+-def removed():
+-    return 1
+"""
+        baseline = "from utils import removed\n\ndef test_removed_basic():\n    assert removed() == 1\n"
+        create_pr_mock, _, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        sandbox.assert_not_called()
+        assert create_pr_mock.call_args.kwargs["files"] == []
+        assert create_pr_mock.call_args.kwargs["deleted_files"] == ["tests/test_utils.py"]
+
+    def test_deleted_source_file_deletes_module_test_file(self, mocker):
+        diff_text = """--- a/app/utils.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def add():
+-    return 1
+"""
+        mocker.patch("app.webhooks.github_webhook.get_push_diff", return_value=diff_text)
+        get_content = mocker.patch("app.webhooks.github_webhook.get_file_content")
+        mocker.patch(
+            "app.webhooks.github_webhook.get_file_content_or_empty",
+            return_value="from utils import add\n\ndef test_add():\n    assert add() == 1\n",
+        )
+        create_pr_mock = mocker.patch("app.webhooks.github_webhook.create_pr")
+        mocker.patch("app.webhooks.github_webhook.post_commit_comment")
+        deleted_files = [
+            {
+                "repo": "user/repo",
+                "path": "app/utils.py",
+                "ref": "abc123",
+                "deleted": True,
+            }
+        ]
+
+        _process_push_event(PUSH_PAYLOAD, deleted_files)
+
+        get_content.assert_not_called()
+        assert create_pr_mock.call_args.kwargs["files"] == []
+        assert create_pr_mock.call_args.kwargs["deleted_files"] == ["tests/test_utils.py"]
+
+    def test_cleanup_validation_failure_posts_specific_comment(self, mocker):
+        old_source = "def removed():\n    return 1\n\ndef current():\n    return 2\n"
+        new_source = "def current():\n    return 2\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,5 +1,2 @@
+-def removed():
+-    return 1
+-
+ def current():
+     return 2
+"""
+        baseline = (
+            "from utils import removed\n"
+            "def test_removed():\n    assert removed() == 1\n\n"
+            "def test_unrelated():\n    assert False\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+        sandbox.return_value = SandboxResult(False, "1 failed", "", 1)
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        assert "could not safely remove obsolete tests" in post_comment_mock.call_args.kwargs["body"]
+
+    def test_rename_removes_old_tests_and_generates_new_block_in_one_pr(self, mocker):
+        old_source = "def old_name():\n    return 1\n"
+        new_source = "def new_name():\n    return 1\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,2 +1,2 @@
+-def old_name():
++def new_name():
+     return 1
+"""
+        baseline = (
+            "from utils import old_name\n\n"
+            "def test_old_name_basic():\n    assert old_name() == 1\n"
+        )
+        mocker.patch("app.webhooks.github_webhook.get_push_diff", return_value=diff_text)
+        mocker.patch("app.webhooks.github_webhook.get_file_content", return_value=new_source)
+        mocker.patch(
+            "app.webhooks.github_webhook.get_file_content_or_empty",
+            side_effect=[old_source, baseline],
+        )
+        mocker.patch(
+            "app.webhooks.github_webhook.extract_modified_functions",
+            return_value=[_fn("new_name")],
+        )
+        create_pr_mock = mocker.patch("app.webhooks.github_webhook.create_pr")
+        post_comment_mock = mocker.patch("app.webhooks.github_webhook.post_commit_comment")
+        mocker.patch.object(
+            webhook_module._agent,
+            "invoke",
+            return_value=_final(
+                "success",
+                "from utils import new_name\n\ndef test_new_name_basic():\n    assert new_name() == 1\n",
+                merged_test_code=(
+                    "from utils import new_name\n\n"
+                    "def test_new_name_basic():\n    assert new_name() == 1\n"
+                ),
+            ),
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        content = create_pr_mock.call_args.kwargs["files"][0][1]
+        assert "old_name" not in content
+        assert "test_new_name_basic" in content
+        assert create_pr_mock.call_args.kwargs["deleted_files"] == []
         post_comment_mock.assert_not_called()

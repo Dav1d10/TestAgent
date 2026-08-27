@@ -157,3 +157,41 @@ class TestCreatePr:
 
         put_call = mock_client.put.call_args
         assert put_call.kwargs["json"]["sha"] == "existing_blob_sha"
+
+    def test_deletes_existing_file_on_branch(self, mocker):
+        mock_client = mocker.MagicMock()
+
+        def get_side_effect(url, **kwargs):
+            if url.endswith("/repos/owner/repo"):
+                return _FakeResponse(json_data={"default_branch": "main"})
+            if "git/ref/heads/main" in url:
+                return _FakeResponse(json_data={"object": {"sha": "base_sha"}})
+            if "/contents/tests/test_x.py" in url:
+                return _FakeResponse(json_data={"sha": "obsolete_blob_sha"})
+            raise AssertionError(f"unexpected GET {url}")
+
+        mock_client.get.side_effect = get_side_effect
+        mock_client.post.side_effect = [
+            _FakeResponse(),
+            _FakeResponse(json_data={"html_url": "https://github.com/owner/repo/pull/3"}),
+        ]
+        mock_client.delete.return_value = _FakeResponse()
+        mocker.patch("httpx.Client").return_value.__enter__.return_value = mock_client
+
+        github_client.create_pr(
+            repo="owner/repo",
+            branch="test-agent/push/abc1234",
+            title="t",
+            body="b",
+            files=[],
+            token="tok",
+            deleted_files=["tests/test_x.py"],
+        )
+
+        delete_call = mock_client.delete.call_args
+        assert "contents/tests/test_x.py" in delete_call.args[0]
+        assert delete_call.kwargs["json"] == {
+            "message": "Remove obsolete generated test file tests/test_x.py",
+            "sha": "obsolete_blob_sha",
+            "branch": "test-agent/push/abc1234",
+        }

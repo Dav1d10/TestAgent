@@ -1,6 +1,10 @@
 from unidiff import PatchSet
 
-from app.tools.code_parser import extract_modified_functions
+from app.tools.code_parser import (
+    extract_deleted_function_names,
+    extract_modified_functions,
+    top_level_function_names,
+)
 
 NEW_FILE_CONTENT = """def add(a, b):
     return a + b
@@ -62,3 +66,24 @@ class TestExtractModifiedFunctions:
 +++ b/math_utils.py
 """
         assert extract_modified_functions(_patched_file(empty_diff), NEW_FILE_CONTENT) == []
+
+
+class TestDeletedFunctions:
+    def test_compares_before_and_after_ast(self):
+        old = "def add():\n    pass\n\ndef removed():\n    pass\n"
+        new = "def add():\n    pass\n"
+        assert extract_deleted_function_names(old, new) == ["removed"]
+
+    def test_rename_is_deletion_plus_addition(self):
+        old = "def old_name():\n    pass\n"
+        new = "def new_name():\n    pass\n"
+        assert extract_deleted_function_names(old, new) == ["old_name"]
+        assert top_level_function_names(new) == ["new_name"]
+
+    def test_preserves_old_source_order(self):
+        old = "def first():\n    pass\n\ndef second():\n    pass\n"
+        assert extract_deleted_function_names(old, "") == ["first", "second"]
+
+    def test_top_level_names_ignore_nested_functions(self):
+        source = "def outer():\n    def inner():\n        pass\n    return inner\n"
+        assert top_level_function_names(source) == ["outer"]

@@ -19,7 +19,11 @@ from unidiff import PatchSet
 from app.agent.graph import build_agent_graph
 from app.agent.state import create_initial_state
 from app.config import GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET
-from app.tools.code_parser import extract_modified_functions
+from app.tools.code_parser import (
+    extract_deleted_function_names,
+    extract_modified_functions,
+    top_level_function_names,
+)
 from app.tools.github_client import (
     create_pr,
     get_file_content,
@@ -27,7 +31,13 @@ from app.tools.github_client import (
     get_push_diff,
     post_commit_comment,
 )
-from app.tools.test_merger import has_bug_annotation
+from app.tools.sandbox import run_test_in_sandbox
+from app.tools.test_merger import (
+    contains_test_cases,
+    find_orphaned_test_functions,
+    has_bug_annotation,
+    remove_owned_test_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,23 +60,25 @@ def _verify_signature(payload_bytes: bytes, signature_header: Optional[str]) -> 
         raise HTTPException(status_code=403, detail="Invalid signature")
 
 
-def _extract_python_files(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+def _extract_python_files(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Return deduplicated list of modified/added .py files (outside tests/) from a
-    push event payload. Uses payload["after"] as the ref for all files so every
-    file is fetched at the same HEAD commit.
+    Return deduplicated modified/added/removed .py files outside tests/.
+
+    The last status seen across the push's commits wins, so a file modified in
+    one commit and removed in a later commit is correctly classified as deleted.
+    Uses payload["after"] as the ref for all files that still exist.
     """
     repo = payload["repository"]["full_name"]
     ref = payload["after"]
-    seen: set = set()
-    results = []
+    by_path: Dict[str, Dict[str, Any]] = {}
     for commit in payload.get("commits", []):
-        changed = commit.get("modified", []) + commit.get("added", [])
-        for path in changed:
-            if path.endswith(".py") and not path.startswith("tests/") and path not in seen:
-                seen.add(path)
-                results.append({"repo": repo, "path": path, "ref": ref})
-    return results
+        for path in commit.get("modified", []) + commit.get("added", []):
+            if path.endswith(".py") and not path.startswith("tests/"):
+                by_path[path] = {"repo": repo, "path": path, "ref": ref, "deleted": False}
+        for path in commit.get("removed", []):
+            if path.endswith(".py") and not path.startswith("tests/"):
+                by_path[path] = {"repo": repo, "path": path, "ref": ref, "deleted": True}
+    return list(by_path.values())
 
 
 def _test_file_path(module_name: str) -> str:
@@ -126,7 +138,22 @@ def _build_unconverged_comment(
     return body
 
 
-def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) -> None:
+def _build_cleanup_failed_comment(module_name: str, function_names: List[str], output: str) -> str:
+    """Report a deterministic orphan-cleanup failure without blaming a healthy function."""
+    names = ", ".join(f"`{name}`" for name in function_names)
+    body = (
+        f"🧹 **TestAgent: could not safely remove obsolete tests in `{module_name}`**\n\n"
+        f"The source functions {names} no longer exist, but the module's test file still did "
+        "not pass after their convention-owned tests/imports were removed. No cleanup PR was "
+        "opened because TestAgent only publishes a test-file update after validating the full "
+        "remaining file in the sandbox."
+    )
+    if output.strip():
+        body += f"\n\n**Sandbox output:**\n```text\n{output.strip()}\n```"
+    return body
+
+
+def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) -> None:
     """
     Background task: for each touched module, diff-parse the modified functions and
     run one agent cycle per function. Each function is handled independently:
@@ -145,7 +172,8 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) ->
     repo = payload["repository"]["full_name"]
     base = payload["before"]
     head = payload["after"]
-    wanted_paths = {f["path"] for f in files}
+    files_by_path = {f["path"]: f for f in files}
+    wanted_paths = set(files_by_path)
 
     try:
         diff_text = get_push_diff(repo=repo, base=base, head=head, token=GITHUB_TOKEN)
@@ -155,11 +183,27 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) ->
         return
 
     pr_files: List[Tuple[str, str]] = []   # (test_path, merged content) — only green tests
+    deleted_test_files: List[str] = []     # module test files removed when no tests can remain
     broken_comments: List[str] = []        # one commit-comment body per failed function
 
     for patched_file in patch_set:
         path = patched_file.path
         if path not in wanted_paths:
+            continue
+
+        module_name = _safe_module_name(Path(path).stem)
+        test_path = _test_file_path(module_name)
+
+        # A deleted source module cannot have runnable module tests. Delete its
+        # corresponding test file directly when one exists at the pushed HEAD.
+        if files_by_path[path].get("deleted", False):
+            try:
+                existing_test = get_file_content_or_empty(repo, test_path, head, GITHUB_TOKEN)
+            except Exception as exc:
+                logger.error("Failed to fetch deleted module baseline %s: %s", test_path, exc)
+                continue
+            if existing_test.strip() and test_path not in deleted_test_files:
+                deleted_test_files.append(test_path)
             continue
 
         try:
@@ -168,11 +212,15 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) ->
             logger.error("Failed to fetch %s: %s", path, exc)
             continue
 
-        module_name = _safe_module_name(Path(path).stem)
-        test_path = _test_file_path(module_name)
-        functions = extract_modified_functions(patched_file, source_code)
-        if not functions:
+        try:
+            old_source_code = get_file_content_or_empty(repo, path, base, GITHUB_TOKEN)
+        except Exception as exc:
+            logger.error("Failed to fetch previous source %s@%s: %s", path, base, exc)
             continue
+
+        functions = extract_modified_functions(patched_file, source_code)
+        current_function_names = top_level_function_names(source_code)
+        deleted_function_names = extract_deleted_function_names(old_source_code, source_code)
 
         # Baseline the module's existing test file so a function's tests merge into
         # it rather than clobbering the tests of untouched functions.
@@ -182,7 +230,63 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) ->
             logger.error("Failed to fetch baseline %s: %s", test_path, exc)
             continue
 
-        module_has_success = False
+        # Hybrid deletion handling:
+        # 1. before/after AST comparison catches this push's deletions;
+        # 2. source/test reconciliation heals stale blocks left by a previously
+        #    missed webhook (the failure reproduced by Stage 4 edge case #9).
+        orphaned_function_names = find_orphaned_test_functions(
+            accumulated,
+            module_name,
+            current_function_names,
+        )
+        cleanup_names = list(
+            dict.fromkeys(deleted_function_names + orphaned_function_names)
+        )
+        old_function_names = top_level_function_names(old_source_code)
+        all_known_names = list(
+            dict.fromkeys(old_function_names + current_function_names + cleanup_names)
+        )
+
+        original_test_file = accumulated
+        if cleanup_names:
+            accumulated = remove_owned_test_blocks(
+                existing_content=accumulated,
+                function_names=cleanup_names,
+                module_name=module_name,
+                all_function_names=all_known_names,
+            )
+
+        cleanup_changed = accumulated != original_test_file
+        module_has_pr_change = False
+        delete_test_file_if_no_success = False
+
+        if cleanup_changed:
+            if contains_test_cases(accumulated):
+                cleanup_result = run_test_in_sandbox(
+                    source_code=source_code,
+                    test_code=accumulated,
+                    module_name=module_name,
+                )
+                if not cleanup_result.passed:
+                    output = cleanup_result.stderr or cleanup_result.stdout
+                    logger.error(
+                        "Cleanup validation failed for %s (%s): %s",
+                        path,
+                        ", ".join(cleanup_names),
+                        output,
+                    )
+                    broken_comments.append(
+                        _build_cleanup_failed_comment(module_name, cleanup_names, output)
+                    )
+                    continue
+                module_has_pr_change = True
+            else:
+                # A module test file with no tests is obsolete. Start any newly
+                # generated block from a clean baseline; if none succeeds, the
+                # existing file will be deleted in the PR.
+                accumulated = ""
+                module_has_pr_change = True
+                delete_test_file_if_no_success = bool(original_test_file.strip())
 
         for fn in functions:
             state = create_initial_state(
@@ -213,7 +317,8 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) ->
                 # Advance the accumulator so the next function in this module merges
                 # on top of this function's green tests.
                 accumulated = final_state["merged_test_code"]
-                module_has_success = True
+                module_has_pr_change = True
+                delete_test_file_if_no_success = False
             else:
                 failing = final_state.get("test_code") or ""
                 if has_bug_annotation(failing):
@@ -225,12 +330,16 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) ->
                         )
                     )
 
-        if module_has_success:
-            pr_files.append((test_path, accumulated))
+        if module_has_pr_change:
+            if contains_test_cases(accumulated):
+                pr_files.append((test_path, accumulated))
+            elif delete_test_file_if_no_success and test_path not in deleted_test_files:
+                deleted_test_files.append(test_path)
 
-    if pr_files:
+    if pr_files or deleted_test_files:
         branch = f"test-agent/push/{head[:7]}"
-        modules = ", ".join(p.split("/")[-1] for p, _ in pr_files)
+        changed_paths = [p for p, _ in pr_files] + deleted_test_files
+        modules = ", ".join(p.split("/")[-1] for p in changed_paths)
         try:
             pr_url = create_pr(
                 repo=repo,
@@ -239,6 +348,7 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, str]]) ->
                 body=f"Auto-generated/updated tests for: {modules}",
                 files=pr_files,
                 token=GITHUB_TOKEN,
+                deleted_files=deleted_test_files,
             )
             logger.info("Opened PR: %s", pr_url)
         except Exception as exc:

@@ -8,7 +8,7 @@ PR-comment functions are out of scope here (see ImplementationPlan.md Stage 4 re
 """
 
 import base64
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import httpx
 
@@ -109,6 +109,7 @@ def create_pr(
     body: str,
     files: List[Tuple[str, str]],
     token: str,
+    deleted_files: Optional[List[str]] = None,
 ) -> str:
     """
     Creates a new branch off the repo's default branch, commits each generated test
@@ -119,8 +120,9 @@ def create_pr(
         branch: name for the new branch, e.g. "test-agent/push/a1b2c3d".
         title: PR title.
         body: PR body (markdown).
-        files: list of (path, content) pairs to commit to the new branch.
+        files: list of (path, content) pairs to create/update on the new branch.
         token: GitHub Personal Access Token with repo write access.
+        deleted_files: paths to delete on the new branch. Missing paths are ignored.
 
     Returns:
         The URL of the created PR.
@@ -172,6 +174,26 @@ def create_pr(
                 json=body_json,
             )
             put_resp.raise_for_status()
+
+        for path in deleted_files or []:
+            existing = client.get(
+                f"{_API}/repos/{repo}/contents/{path}",
+                headers=headers,
+                params={"ref": branch},
+            )
+            if existing.status_code == 404:
+                continue
+            existing.raise_for_status()
+            delete_resp = client.delete(
+                f"{_API}/repos/{repo}/contents/{path}",
+                headers=headers,
+                json={
+                    "message": f"Remove obsolete generated test file {path}",
+                    "sha": existing.json()["sha"],
+                    "branch": branch,
+                },
+            )
+            delete_resp.raise_for_status()
 
         pr_resp = client.post(
             f"{_API}/repos/{repo}/pulls",

@@ -26,6 +26,33 @@ class FunctionInfo:
     line_end: int
 
 
+def top_level_function_names(source_code: str) -> List[str]:
+    """Return module-level function/async-function names in source order."""
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return []
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def extract_deleted_function_names(old_file_content: str, new_file_content: str) -> List[str]:
+    """
+    Return top-level functions present before a push but absent afterwards.
+
+    Deleted functions cannot be mapped against the new-file AST because their
+    nodes no longer exist. Comparing the complete before/after ASTs is both more
+    reliable and simpler than trying to reconstruct definitions from removed
+    diff lines. Source order from the old file is preserved.
+    """
+    old_names = top_level_function_names(old_file_content)
+    new_names = set(top_level_function_names(new_file_content))
+    return [name for name in old_names if name not in new_names]
+
+
 def _changed_line_numbers(file_diff: PatchedFile) -> set:
     """Returns the set of line numbers (in the new file) touched by added lines."""
     changed = set()

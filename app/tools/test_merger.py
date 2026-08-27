@@ -16,20 +16,9 @@ module — so `test_add_all_basic` is owned by `add_all`, never by `add`.
 """
 
 import ast
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
-
-def top_level_function_names(source_code: str) -> List[str]:
-    """Return the names of all module-level function/async-function definitions."""
-    try:
-        tree = ast.parse(source_code)
-    except SyntaxError:
-        return []
-    return [
-        node.name
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
+from app.tools.code_parser import top_level_function_names
 
 
 def has_bug_annotation(code: str) -> bool:
@@ -46,15 +35,21 @@ def _test_matches_function(test_name: str, fn: str) -> bool:
     return test_name == f"test_{fn}" or test_name.startswith(f"test_{fn}_")
 
 
+def _test_owner(test_name: str, all_function_names: List[str]) -> Optional[str]:
+    """Return the longest function-name match for a test, or None."""
+    candidates = [fn for fn in all_function_names if _test_matches_function(test_name, fn)]
+    return max(candidates, key=len) if candidates else None
+
+
 def _owns_test(test_name: str, function_name: str, all_function_names: List[str]) -> bool:
     """
     Decide whether `test_name` belongs to `function_name`, resolving prefix
     ambiguity (`add` vs `add_all`) by longest-matching source function name.
     """
-    candidates = [fn for fn in all_function_names if _test_matches_function(test_name, fn)]
-    if not candidates:
+    owner = _test_owner(test_name, all_function_names)
+    if owner is None:
         return _test_matches_function(test_name, function_name)
-    return max(candidates, key=len) == function_name
+    return owner == function_name
 
 
 def _node_span(node: ast.AST) -> tuple:
@@ -114,6 +109,137 @@ def _insert_imports(base: str, new_imports: List[str]) -> str:
         return "\n".join(new_imports) + "\n\n" + base
     head, tail = lines[:last_import_end], lines[last_import_end:]
     return "\n".join(head + new_imports + tail)
+
+
+def _format_import_from(node: ast.ImportFrom, aliases: List[ast.alias]) -> str:
+    """Render an ImportFrom after selected aliases have been removed."""
+    prefix = "." * node.level
+    module = node.module or ""
+    names = ", ".join(
+        f"{alias.name} as {alias.asname}" if alias.asname else alias.name
+        for alias in aliases
+    )
+    return f"from {prefix}{module} import {names}"
+
+
+def _apply_line_edits(source: str, edits: Dict[int, Tuple[int, Optional[str]]]) -> str:
+    """Apply non-overlapping 1-indexed whole-line edits while preserving other text."""
+    lines = source.splitlines()
+    output: List[str] = []
+    line_no = 1
+    while line_no <= len(lines):
+        edit = edits.get(line_no)
+        if edit is None:
+            output.append(lines[line_no - 1])
+            line_no += 1
+            continue
+        end, replacement = edit
+        if replacement is not None:
+            output.append(replacement)
+        line_no = end + 1
+    return "\n".join(output).rstrip() + "\n"
+
+
+def find_orphaned_test_functions(
+    existing_content: str,
+    module_name: str,
+    current_function_names: List[str],
+) -> List[str]:
+    """
+    Infer stale function-owned test blocks from exact-module imports.
+
+    This is the self-healing path for a missed deletion webhook: a symbol
+    imported from the sandbox module is considered orphaned only when it no
+    longer exists in the current source *and* at least one convention-named test
+    is owned by it. Requiring both signals avoids deleting unrelated imports.
+    """
+    try:
+        tree = ast.parse(existing_content)
+    except SyntaxError:
+        return []
+
+    imported_names: List[str] = []
+    test_names: List[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == module_name:
+            imported_names.extend(alias.name for alias in node.names if alias.name != "*")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            test_names.append(node.name)
+
+    current = set(current_function_names)
+    missing = [name for name in imported_names if name not in current]
+    all_candidates = list(dict.fromkeys(current_function_names + imported_names))
+    return [
+        name
+        for name in missing
+        if any(_test_owner(test_name, all_candidates) == name for test_name in test_names)
+    ]
+
+
+def remove_owned_test_blocks(
+    existing_content: str,
+    function_names: List[str],
+    module_name: str,
+    all_function_names: Optional[List[str]] = None,
+) -> str:
+    """
+    Remove convention-owned tests and their exact-module import aliases.
+
+    Other test functions and arbitrary human-authored content are preserved
+    byte-for-byte. For a shared import such as ``from utils import add, sub``,
+    only aliases belonging to removed functions are pruned.
+    """
+    if not existing_content.strip() or not function_names:
+        return existing_content
+    try:
+        tree = ast.parse(existing_content)
+    except SyntaxError:
+        return existing_content
+
+    targets: Set[str] = set(function_names)
+    all_fns = all_function_names or function_names
+    edits: Dict[int, Tuple[int, Optional[str]]] = {}
+
+    # Only claim a deleted function when at least one convention-owned test
+    # proves this file contains an agent-owned block for it. Differently named
+    # human tests remain outside the agent's ownership boundary.
+    owned_targets: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            owner = _test_owner(node.name, all_fns)
+            if owner in targets:
+                owned_targets.add(owner)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            owner = _test_owner(node.name, all_fns)
+            if owner in owned_targets:
+                start, end = _node_span(node)
+                edits[start] = (end, None)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == module_name:
+            remaining = [alias for alias in node.names if alias.name not in owned_targets]
+            if len(remaining) != len(node.names):
+                start, end = _node_span(node)
+                replacement = _format_import_from(node, remaining) if remaining else None
+                edits[start] = (end, replacement)
+
+    return _apply_line_edits(existing_content, edits) if edits else existing_content
+
+
+def contains_test_cases(source_code: str) -> bool:
+    """True when a test module still contains pytest-style functions or classes."""
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return False
+    return any(
+        (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name.startswith("test_")
+        )
+        or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
+        for node in tree.body
+    )
 
 
 def merge_test_block(
