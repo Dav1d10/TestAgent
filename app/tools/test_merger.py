@@ -16,9 +16,18 @@ module — so `test_add_all_basic` is owned by `add_all`, never by `add`.
 """
 
 import ast
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from app.tools.code_parser import top_level_function_names
+
+
+@dataclass(frozen=True)
+class PreservedTestDependency:
+    """A deleted source symbol referenced by test content TestAgent cannot own."""
+
+    function_name: str
+    affected_nodes: Tuple[str, ...]
 
 
 def has_bug_annotation(code: str) -> bool:
@@ -50,6 +59,48 @@ def _owns_test(test_name: str, function_name: str, all_function_names: List[str]
     if owner is None:
         return _test_matches_function(test_name, function_name)
     return owner == function_name
+
+
+def _preserved_node_label(node: ast.AST) -> str:
+    """Return a stable, human-readable label for preserved top-level content."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name
+    return f"module-level code at line {getattr(node, 'lineno', '?')}"
+
+
+def _bound_target_names(target: ast.AST) -> Set[str]:
+    """Return simple names bound by an assignment target."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: Set[str] = set()
+        for element in target.elts:
+            names.update(_bound_target_names(element))
+        return names
+    return set()
+
+
+def _top_level_bound_names(source_code: str) -> Set[str]:
+    """Return statically visible module names, not only functions."""
+    try:
+        tree = ast.parse(source_code)
+    except SyntaxError:
+        return set()
+
+    names: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(_bound_target_names(target))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            names.update(_bound_target_names(node.target))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name.split(".")[0])
+    return names
 
 
 def _node_span(node: ast.AST) -> tuple:
@@ -173,6 +224,167 @@ def find_orphaned_test_functions(
         name
         for name in missing
         if any(_test_owner(test_name, all_candidates) == name for test_name in test_names)
+    ]
+
+
+def find_preserved_test_dependencies(
+    existing_content: str,
+    module_name: str,
+    deleted_function_names: List[str],
+    current_function_names: List[str],
+    current_source_code: Optional[str] = None,
+) -> List[PreservedTestDependency]:
+    """
+    Find deleted/missing source symbols used by test content cleanup must preserve.
+
+    Ownership and dependency are deliberately separate:
+
+    - Convention-owned top-level ``test_{function}*`` blocks may be removed.
+    - Every other top-level block is human/unknown content and must be preserved.
+
+    Exact-module imports are resolved through their local bindings, including
+    ``as`` aliases. ``import module as alias`` plus ``alias.symbol`` is also
+    supported. Scanning whole preserved blocks naturally catches fixtures,
+    helpers, classes, nested functions, and module-level expressions. Missing
+    imports discovered during reconciliation are included even when the original
+    deletion webhook was not delivered.
+    """
+    if not existing_content.strip():
+        return []
+    try:
+        tree = ast.parse(existing_content)
+    except SyntaxError:
+        return []
+
+    # Reconciliation must not mistake a still-existing imported constant or
+    # class for a deleted function merely because it is absent from the list of
+    # current functions. Callers with source access provide the full module so
+    # every statically bound top-level name can suppress that false positive.
+    current = (
+        _top_level_bound_names(current_source_code)
+        if current_source_code is not None
+        else set(current_function_names)
+    )
+    candidates: List[str] = list(dict.fromkeys(deleted_function_names))
+
+    # First collect every local name that can resolve back to the exact source
+    # module. This pre-pass also discovers stale symbols for missed-webhook
+    # reconciliation, where deleted_function_names is empty.
+    global_direct_bindings: Dict[str, str] = {}
+    all_module_bindings: Set[str] = set()
+    global_module_bindings: Set[str] = set()
+    top_level_direct_imports: List[Tuple[ast.ImportFrom, str]] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == module_name:
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                if alias.name not in current and alias.name not in candidates:
+                    candidates.append(alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == module_name:
+                    all_module_bindings.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in all_module_bindings
+            and node.attr not in current
+            and node.attr not in candidates
+        ):
+            candidates.append(node.attr)
+
+    if not candidates:
+        return []
+
+    candidate_set = set(candidates)
+    all_function_names = list(dict.fromkeys(current_function_names + candidates))
+
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == module_name:
+            for alias in node.names:
+                if alias.name in candidate_set:
+                    global_direct_bindings[alias.asname or alias.name] = alias.name
+                    top_level_direct_imports.append((node, alias.name))
+                elif alias.name == "*":
+                    for candidate in candidates:
+                        global_direct_bindings[candidate] = candidate
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == module_name:
+                    global_module_bindings.add(alias.asname or alias.name)
+
+    owned_nodes: Set[int] = set()
+    owned_targets: Set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            owner = _test_owner(node.name, all_function_names)
+            if owner in candidate_set:
+                owned_nodes.add(id(node))
+                owned_targets.add(owner)
+
+    affected: Dict[str, List[str]] = {candidate: [] for candidate in candidates}
+
+    def add_reference(function_name: str, label: str) -> None:
+        labels = affected[function_name]
+        if label not in labels:
+            labels.append(label)
+
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)) or id(node) in owned_nodes:
+            continue
+
+        label = _preserved_node_label(node)
+        direct_bindings = dict(global_direct_bindings)
+        module_bindings = set(global_module_bindings)
+
+        # Imports inside a preserved block are scoped there, but importing a
+        # deleted symbol is already sufficient to mark that block as affected.
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.ImportFrom)
+                and child.level == 0
+                and child.module == module_name
+            ):
+                for alias in child.names:
+                    if alias.name in candidate_set:
+                        direct_bindings[alias.asname or alias.name] = alias.name
+                        add_reference(alias.name, label)
+                    elif alias.name == "*":
+                        for candidate in candidates:
+                            direct_bindings[candidate] = candidate
+            elif isinstance(child, ast.Import):
+                for alias in child.names:
+                    if alias.name == module_name:
+                        module_bindings.add(alias.asname or alias.name)
+
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                target = direct_bindings.get(child.id)
+                if target is not None:
+                    add_reference(target, label)
+            elif (
+                isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id in module_bindings
+                and child.attr in candidate_set
+            ):
+                add_reference(child.attr, label)
+
+    # A top-level ``from module import deleted`` fails during collection even
+    # when the binding is unused. It is safe to remove only when at least one
+    # convention-owned block establishes TestAgent ownership for that symbol.
+    for import_node, function_name in top_level_direct_imports:
+        if function_name not in owned_targets and not affected[function_name]:
+            add_reference(function_name, f"import at line {import_node.lineno}")
+
+    return [
+        PreservedTestDependency(name, tuple(affected[name]))
+        for name in candidates
+        if affected[name]
     ]
 
 

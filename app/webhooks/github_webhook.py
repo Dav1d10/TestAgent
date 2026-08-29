@@ -33,8 +33,10 @@ from app.tools.github_client import (
 )
 from app.tools.sandbox import run_test_in_sandbox
 from app.tools.test_merger import (
+    PreservedTestDependency,
     contains_test_cases,
     find_orphaned_test_functions,
+    find_preserved_test_dependencies,
     has_bug_annotation,
     remove_owned_test_blocks,
 )
@@ -153,6 +155,35 @@ def _build_cleanup_failed_comment(module_name: str, function_names: List[str], o
     return body
 
 
+def _build_preserved_dependency_comment(
+    module_name: str,
+    dependencies: List[PreservedTestDependency],
+    output: str,
+    sandbox_passed: bool,
+) -> str:
+    """Report deleted symbols still used by human/ownership-unknown test content."""
+    details = "\n".join(
+        f"- `{dependency.function_name}`: "
+        + ", ".join(f"`{node}`" for node in dependency.affected_nodes)
+        for dependency in dependencies
+    )
+    verdict = "PASSED" if sandbox_passed else "FAILED"
+    body = (
+        f"🛑 **TestAgent: human/unknown tests still depend on deleted code in `{module_name}`**\n\n"
+        "TestAgent found preserved test content that statically references source functions "
+        "which no longer exist. These blocks do not follow TestAgent's ownership convention, "
+        "so they may be human-authored and were left byte-for-byte unchanged.\n\n"
+        f"**Affected preserved content:**\n{details}\n\n"
+        "No cleanup PR was opened for this module, and generation for its other modified "
+        "functions was skipped. Manual review is required before this test file can be safely "
+        "reconciled.\n\n"
+        f"**Unchanged-file sandbox validation: {verdict}**"
+    )
+    if output.strip():
+        body += f"\n```text\n{output.strip()}\n```"
+    return body
+
+
 def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) -> None:
     """
     Background task: for each touched module, diff-parse the modified functions and
@@ -194,15 +225,54 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
         module_name = _safe_module_name(Path(path).stem)
         test_path = _test_file_path(module_name)
 
-        # A deleted source module cannot have runnable module tests. Delete its
-        # corresponding test file directly when one exists at the pushed HEAD.
+        # A fully deleted source module normally makes its convention-owned test
+        # file obsolete. Preserve it instead when human/unknown blocks still
+        # reference any of the deleted functions: ownership is not sufficient to
+        # delete those blocks safely, even though the unchanged file will fail.
         if files_by_path[path].get("deleted", False):
             try:
                 existing_test = get_file_content_or_empty(repo, test_path, head, GITHUB_TOKEN)
             except Exception as exc:
                 logger.error("Failed to fetch deleted module baseline %s: %s", test_path, exc)
                 continue
-            if existing_test.strip() and test_path not in deleted_test_files:
+            if not existing_test.strip():
+                continue
+            try:
+                old_source_code = get_file_content_or_empty(repo, path, base, GITHUB_TOKEN)
+            except Exception as exc:
+                logger.error("Failed to fetch deleted source %s@%s: %s", path, base, exc)
+                continue
+
+            deleted_names = top_level_function_names(old_source_code)
+            preserved_dependencies = find_preserved_test_dependencies(
+                existing_content=existing_test,
+                module_name=module_name,
+                deleted_function_names=deleted_names,
+                current_function_names=[],
+                current_source_code="",
+            )
+            if preserved_dependencies:
+                sandbox_result = run_test_in_sandbox(
+                    source_code="",
+                    test_code=existing_test,
+                    module_name=module_name,
+                )
+                output = "\n".join(
+                    part.strip()
+                    for part in (sandbox_result.stdout, sandbox_result.stderr)
+                    if part.strip()
+                )
+                broken_comments.append(
+                    _build_preserved_dependency_comment(
+                        module_name,
+                        preserved_dependencies,
+                        output,
+                        sandbox_result.passed,
+                    )
+                )
+                continue
+
+            if test_path not in deleted_test_files:
                 deleted_test_files.append(test_path)
             continue
 
@@ -239,6 +309,45 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
             module_name,
             current_function_names,
         )
+
+        preserved_dependencies = find_preserved_test_dependencies(
+            existing_content=accumulated,
+            module_name=module_name,
+            deleted_function_names=deleted_function_names,
+            current_function_names=current_function_names,
+            current_source_code=source_code,
+        )
+        if preserved_dependencies:
+            # Any affected human/unknown block makes partial cleanup unsafe. Keep
+            # the entire baseline unchanged, validate that exact state for useful
+            # evidence, warn on the triggering commit, and skip this module.
+            sandbox_result = run_test_in_sandbox(
+                source_code=source_code,
+                test_code=accumulated,
+                module_name=module_name,
+            )
+            output = "\n".join(
+                part.strip()
+                for part in (sandbox_result.stdout, sandbox_result.stderr)
+                if part.strip()
+            )
+            logger.warning(
+                "Preserved test dependencies block cleanup for %s: %s",
+                path,
+                ", ".join(
+                    dependency.function_name for dependency in preserved_dependencies
+                ),
+            )
+            broken_comments.append(
+                _build_preserved_dependency_comment(
+                    module_name,
+                    preserved_dependencies,
+                    output,
+                    sandbox_result.passed,
+                )
+            )
+            continue
+
         cleanup_names = list(
             dict.fromkeys(deleted_function_names + orphaned_function_names)
         )

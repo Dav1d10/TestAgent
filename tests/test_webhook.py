@@ -440,7 +440,10 @@ class TestProcessPushEvent:
         get_content = mocker.patch("app.webhooks.github_webhook.get_file_content")
         mocker.patch(
             "app.webhooks.github_webhook.get_file_content_or_empty",
-            return_value="from utils import add\n\ndef test_add():\n    assert add() == 1\n",
+            side_effect=[
+                "from utils import add\n\ndef test_add():\n    assert add() == 1\n",
+                "def add():\n    return 1\n",
+            ],
         )
         create_pr_mock = mocker.patch("app.webhooks.github_webhook.create_pr")
         mocker.patch("app.webhooks.github_webhook.post_commit_comment")
@@ -485,6 +488,180 @@ class TestProcessPushEvent:
 
         create_pr_mock.assert_not_called()
         assert "could not safely remove obsolete tests" in post_comment_mock.call_args.kwargs["body"]
+
+    def test_human_alias_dependency_preserves_file_and_posts_comment(self, mocker):
+        old_source = "def removed():\n    return 1\n\ndef current():\n    return 2\n"
+        new_source = "def current():\n    return 2\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,5 +1,2 @@
+-def removed():
+-    return 1
+-
+ def current():
+     return 2
+"""
+        baseline = (
+            "from utils import removed as operation\n\n"
+            "def test_custom_contract():\n    assert operation() == 1\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+        sandbox.return_value = SandboxResult(
+            False,
+            "ImportError: cannot import name 'removed'",
+            "",
+            2,
+        )
+        agent_invoke = mocker.patch.object(webhook_module._agent, "invoke")
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        agent_invoke.assert_not_called()
+        create_pr_mock.assert_not_called()
+        sandbox.assert_called_once_with(
+            source_code=new_source,
+            test_code=baseline,
+            module_name="utils",
+        )
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "human/unknown tests still depend on deleted code" in body
+        assert "`removed`" in body
+        assert "`test_custom_contract`" in body
+        assert "ImportError" in body
+        assert "No cleanup PR was opened" in body
+
+    def test_one_human_dependency_blocks_mixed_owned_cleanup(self, mocker):
+        old_source = "def removed():\n    return 1\n\ndef current():\n    return 2\n"
+        new_source = "def current():\n    return 2\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,5 +1,2 @@
+-def removed():
+-    return 1
+-
+ def current():
+     return 2
+"""
+        baseline = (
+            "from utils import removed as operation\n\n"
+            "def test_removed_basic():\n    assert operation() == 1\n\n"
+            "def test_custom_contract():\n    assert operation() == 1\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+        sandbox.return_value = SandboxResult(False, "collection failed", "", 2)
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        # The convention-owned block is also preserved: partial cleanup would
+        # still leave a broken file and would obscure the manual intervention.
+        assert sandbox.call_args.kwargs["test_code"] == baseline
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "`test_custom_contract`" in body
+        assert "`test_removed_basic`" not in body
+
+    def test_missed_webhook_human_dependency_is_reconciled_on_later_touch(self, mocker):
+        source = "def current():\n    # touched later\n    return 2\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,2 +1,3 @@
+ def current():
++    # touched later
+     return 2
+"""
+        baseline = (
+            "from utils import removed as operation\n\n"
+            "def test_custom_contract():\n    assert operation() == 1\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, source, source, baseline, diff_text
+        )
+        sandbox.return_value = SandboxResult(False, "stale import", "", 2)
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        sandbox.assert_called_once()
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "`removed`" in body
+        assert "`test_custom_contract`" in body
+
+    def test_preserved_dependency_warns_even_if_unchanged_file_passes(self, mocker):
+        old_source = "def removed():\n    return 1\n"
+        new_source = ""
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,2 +0,0 @@
+-def removed():
+-    return 1
+"""
+        baseline = (
+            "import utils\n\n"
+            "def test_custom_contract():\n"
+            "    if False:\n"
+            "        utils.removed()\n"
+            "    assert True\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+        sandbox.return_value = SandboxResult(True, "1 passed", "", 0)
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        sandbox.assert_called_once()
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "Unchanged-file sandbox validation: PASSED" in body
+        assert "Manual review is required" in body
+
+    def test_deleted_source_file_with_human_dependency_is_not_deleted(self, mocker):
+        old_source = "def removed():\n    return 1\n"
+        baseline = (
+            "from utils import removed as operation\n\n"
+            "def test_custom_contract():\n    assert operation() == 1\n"
+        )
+        diff_text = """--- a/app/utils.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def removed():
+-    return 1
+"""
+        mocker.patch("app.webhooks.github_webhook.get_push_diff", return_value=diff_text)
+        mocker.patch(
+            "app.webhooks.github_webhook.get_file_content_or_empty",
+            side_effect=[baseline, old_source],
+        )
+        create_pr_mock = mocker.patch("app.webhooks.github_webhook.create_pr")
+        post_comment_mock = mocker.patch("app.webhooks.github_webhook.post_commit_comment")
+        sandbox = mocker.patch(
+            "app.webhooks.github_webhook.run_test_in_sandbox",
+            return_value=SandboxResult(False, "ImportError", "", 2),
+        )
+        deleted_files = [
+            {
+                "repo": "user/repo",
+                "path": "app/utils.py",
+                "ref": "abc123",
+                "deleted": True,
+            }
+        ]
+
+        _process_push_event(PUSH_PAYLOAD, deleted_files)
+
+        create_pr_mock.assert_not_called()
+        sandbox.assert_called_once_with(
+            source_code="",
+            test_code=baseline,
+            module_name="utils",
+        )
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "`test_custom_contract`" in body
+        assert "human/unknown" in body
 
     def test_rename_removes_old_tests_and_generates_new_block_in_one_pr(self, mocker):
         old_source = "def old_name():\n    return 1\n"

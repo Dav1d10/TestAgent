@@ -1,8 +1,10 @@
 import ast
 
 from app.tools.test_merger import (
+    PreservedTestDependency,
     contains_test_cases,
     find_orphaned_test_functions,
+    find_preserved_test_dependencies,
     merge_test_block,
     remove_owned_test_blocks,
     top_level_function_names,
@@ -156,6 +158,99 @@ class TestOrphanReconciliation:
             "def test_add_all_basic():\n    assert add_all([]) == 0\n"
         )
         assert find_orphaned_test_functions(existing, "utils", ["add_all"]) == []
+
+
+class TestPreservedDependencies:
+    def test_finds_human_test_using_import_alias(self):
+        existing = (
+            "from utils import removed as operation\n\n"
+            "def test_custom_behavior():\n    assert operation() == 1\n"
+        )
+
+        assert find_preserved_test_dependencies(
+            existing, "utils", ["removed"], [], ""
+        ) == [PreservedTestDependency("removed", ("test_custom_behavior",))]
+
+    def test_owned_convention_test_is_safe_to_remove(self):
+        existing = (
+            "from utils import removed as operation\n\n"
+            "def test_removed_basic():\n    assert operation() == 1\n"
+        )
+
+        assert find_preserved_test_dependencies(
+            existing, "utils", ["removed"], [], ""
+        ) == []
+
+    def test_one_human_reference_blocks_mixed_owned_cleanup(self):
+        existing = (
+            "from utils import removed as operation\n\n"
+            "def test_removed_basic():\n    assert operation() == 1\n\n"
+            "def test_custom_contract():\n    assert operation() == 1\n"
+        )
+
+        assert find_preserved_test_dependencies(
+            existing, "utils", ["removed"], [], ""
+        ) == [PreservedTestDependency("removed", ("test_custom_contract",))]
+
+    def test_finds_module_qualified_reference(self):
+        existing = (
+            "import utils as helpers\n\n"
+            "class TestCustomContract:\n"
+            "    def test_value(self):\n"
+            "        assert helpers.removed() == 1\n"
+        )
+
+        assert find_preserved_test_dependencies(
+            existing, "utils", ["removed"], [], ""
+        ) == [PreservedTestDependency("removed", ("TestCustomContract",))]
+
+    def test_finds_reference_inside_preserved_helper(self):
+        existing = (
+            "from utils import removed as operation\n\n"
+            "def build_value():\n    return operation()\n\n"
+            "def test_custom_contract():\n    assert build_value() == 1\n"
+        )
+
+        assert find_preserved_test_dependencies(
+            existing, "utils", ["removed"], [], ""
+        ) == [PreservedTestDependency("removed", ("build_value",))]
+
+    def test_unused_unowned_from_import_still_breaks_collection(self):
+        existing = "from utils import removed\n\ndef test_unrelated():\n    assert True\n"
+
+        assert find_preserved_test_dependencies(
+            existing, "utils", ["removed"], [], ""
+        ) == [PreservedTestDependency("removed", ("import at line 1",))]
+
+    def test_reconciles_human_dependency_after_missed_webhook(self):
+        existing = (
+            "from utils import removed as operation\n\n"
+            "def test_custom_contract():\n    assert operation() == 1\n"
+        )
+        current_source = "def current():\n    return 2\n"
+
+        assert find_preserved_test_dependencies(
+            existing,
+            "utils",
+            [],
+            ["current"],
+            current_source,
+        ) == [PreservedTestDependency("removed", ("test_custom_contract",))]
+
+    def test_existing_non_function_symbol_is_not_a_false_positive(self):
+        existing = (
+            "from utils import LIMIT\n\n"
+            "def test_custom_contract():\n    assert LIMIT == 3\n"
+        )
+        current_source = "LIMIT = 3\n\ndef current():\n    return LIMIT\n"
+
+        assert find_preserved_test_dependencies(
+            existing,
+            "utils",
+            [],
+            ["current"],
+            current_source,
+        ) == []
 
 
 class TestContainsTestCases:
