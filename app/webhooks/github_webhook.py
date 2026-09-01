@@ -31,7 +31,7 @@ from app.tools.github_client import (
     get_push_diff,
     post_commit_comment,
 )
-from app.tools.sandbox import run_test_in_sandbox
+from app.tools.sandbox import SandboxOutcome, run_test_in_sandbox
 from app.tools.test_merger import (
     PreservedTestDependency,
     contains_test_cases,
@@ -155,11 +155,28 @@ def _build_cleanup_failed_comment(module_name: str, function_names: List[str], o
     return body
 
 
+def _build_infrastructure_error_comment(
+    module_name: str, subject: str, output: str
+) -> str:
+    """Report an inconclusive run caused by the sandbox infrastructure."""
+    body = (
+        f"🛠️ **TestAgent: sandbox infrastructure error for {subject}**\n\n"
+        f"The tests in `{module_name}` were not evaluated because the isolated execution "
+        "environment could not start or complete normally. This is an operational failure, "
+        "not evidence that the generated tests or source implementation are incorrect. "
+        "TestAgent stopped without asking the model to rewrite the tests, and no PR was "
+        "opened for this operation."
+    )
+    if output.strip():
+        body += f"\n\n**Infrastructure diagnostic:**\n```text\n{output.strip()}\n```"
+    return body
+
+
 def _build_preserved_dependency_comment(
     module_name: str,
     dependencies: List[PreservedTestDependency],
     output: str,
-    sandbox_passed: bool,
+    sandbox_outcome: SandboxOutcome,
 ) -> str:
     """Report deleted symbols still used by human/ownership-unknown test content."""
     details = "\n".join(
@@ -167,7 +184,12 @@ def _build_preserved_dependency_comment(
         + ", ".join(f"`{node}`" for node in dependency.affected_nodes)
         for dependency in dependencies
     )
-    verdict = "PASSED" if sandbox_passed else "FAILED"
+    verdict = {
+        SandboxOutcome.PASSED: "PASSED",
+        SandboxOutcome.TEST_FAILED: "FAILED",
+        SandboxOutcome.TIMED_OUT: "TIMED OUT",
+        SandboxOutcome.INFRASTRUCTURE_ERROR: "INCONCLUSIVE — INFRASTRUCTURE ERROR",
+    }[sandbox_outcome]
     body = (
         f"🛑 **TestAgent: human/unknown tests still depend on deleted code in `{module_name}`**\n\n"
         "TestAgent found preserved test content that statically references source functions "
@@ -195,6 +217,8 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
     - A function whose test fails all attempts never enters the PR; it produces a
       commit comment instead — differentiated between "the function looks buggy"
       (a `# BUG:` annotation is present) and "the agent could not converge".
+    - A sandbox infrastructure error stops that function immediately, never enters
+      the LLM correction loop, and produces an explicitly inconclusive comment.
 
     PR and commit comments are independent: a single push can produce both.
     Runs synchronously in a thread pool (Starlette's BackgroundTasks calls
@@ -267,7 +291,7 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
                         module_name,
                         preserved_dependencies,
                         output,
-                        sandbox_result.passed,
+                        sandbox_result.outcome,
                     )
                 )
                 continue
@@ -343,7 +367,7 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
                     module_name,
                     preserved_dependencies,
                     output,
-                    sandbox_result.passed,
+                    sandbox_result.outcome,
                 )
             )
             continue
@@ -377,16 +401,30 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
                     module_name=module_name,
                 )
                 if not cleanup_result.passed:
-                    output = cleanup_result.stderr or cleanup_result.stdout
+                    output = "\n".join(
+                        part.strip()
+                        for part in (cleanup_result.stdout, cleanup_result.stderr)
+                        if part.strip()
+                    )
                     logger.error(
                         "Cleanup validation failed for %s (%s): %s",
                         path,
                         ", ".join(cleanup_names),
                         output,
                     )
-                    broken_comments.append(
-                        _build_cleanup_failed_comment(module_name, cleanup_names, output)
-                    )
+                    if cleanup_result.outcome == SandboxOutcome.INFRASTRUCTURE_ERROR:
+                        names = ", ".join(f"`{name}`" for name in cleanup_names)
+                        broken_comments.append(
+                            _build_infrastructure_error_comment(
+                                module_name,
+                                f"obsolete-test cleanup ({names})",
+                                output,
+                            )
+                        )
+                    else:
+                        broken_comments.append(
+                            _build_cleanup_failed_comment(module_name, cleanup_names, output)
+                        )
                     continue
                 module_has_pr_change = True
             else:
@@ -428,6 +466,22 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
                 accumulated = final_state["merged_test_code"]
                 module_has_pr_change = True
                 delete_test_file_if_no_success = False
+            elif final_state["final_status"] == "infrastructure_error":
+                output = "\n".join(
+                    part.strip()
+                    for part in (
+                        final_state.get("test_stdout") or "",
+                        final_state.get("test_stderr") or "",
+                    )
+                    if part.strip()
+                )
+                broken_comments.append(
+                    _build_infrastructure_error_comment(
+                        module_name,
+                        f"`{fn.name}`",
+                        output,
+                    )
+                )
             else:
                 failing = final_state.get("test_code") or ""
                 if has_bug_annotation(failing):

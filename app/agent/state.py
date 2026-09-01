@@ -24,6 +24,7 @@ class AgentState(TypedDict):
     merged_test_code: Optional[str]  # test_code merged into existing_test_file — this is what
                                      # runs in the sandbox and, on success, goes into the PR
     test_passed: Optional[bool]     # result of the last sandbox run
+    sandbox_outcome: Optional[str]  # passed | test_failed | timed_out | infrastructure_error
     test_stdout: Optional[str]      # pytest stdout
     test_stderr: Optional[str]      # pytest stderr / error details
 
@@ -32,7 +33,7 @@ class AgentState(TypedDict):
     max_attempts: int       # ceiling before giving up (default: 3)
 
     # Final outcome
-    final_status: Optional[str]     # "success" | "failed_max_attempts" | "error"
+    final_status: Optional[str]     # success | failed_max_attempts | infrastructure_error | error
     error_message: Optional[str]    # detail when something fails outside normal flow
 
 
@@ -52,6 +53,7 @@ def create_initial_state(
         test_code=None,
         merged_test_code=None,
         test_passed=None,
+        sandbox_outcome=None,
         test_stdout=None,
         test_stderr=None,
         attempt_count=0,

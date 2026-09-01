@@ -8,7 +8,7 @@ from app.agent.nodes import (
     finalize_node,
     should_retry,
 )
-from app.tools.sandbox import SandboxResult
+from app.tools.sandbox import SandboxOutcome, SandboxResult
 from tests.fixtures.sample_functions import SIMPLE_ADD, VALIDATE_AGE
 
 
@@ -26,6 +26,29 @@ def test_graph_compiles():
     graph = build_agent_graph()
     nodes = set(graph.get_graph().nodes.keys())
     assert {"generate_test", "run_test", "fix_test", "finalize"}.issubset(nodes)
+
+
+def test_graph_does_not_retry_llm_after_infrastructure_error(mocker):
+    llm = mocker.patch(
+        "app.agent.nodes._call_llm",
+        return_value="def test_add():\n    assert add(1, 2) == 3",
+    )
+    sandbox = mocker.patch(
+        "app.agent.nodes.run_test_in_sandbox",
+        return_value=SandboxResult(
+            outcome=SandboxOutcome.INFRASTRUCTURE_ERROR,
+            stdout="",
+            stderr="Cannot connect to the Docker daemon",
+            exit_code=1,
+        ),
+    )
+
+    result = build_agent_graph().invoke(_state())
+
+    assert result["final_status"] == "infrastructure_error"
+    assert result["attempt_count"] == 1
+    assert llm.call_count == 1
+    assert sandbox.call_count == 1
 
 
 # ── generate_test_node ────────────────────────────────────────────────────────
@@ -79,21 +102,49 @@ class TestRunTestNode:
     def test_sets_passed_true_on_success(self, mocker):
         mocker.patch(
             "app.agent.nodes.run_test_in_sandbox",
-            return_value=SandboxResult(passed=True, stdout="1 passed", stderr="", exit_code=0),
+            return_value=SandboxResult(
+                outcome=SandboxOutcome.PASSED,
+                stdout="1 passed",
+                stderr="",
+                exit_code=0,
+            ),
         )
         result = run_test_node(_state(test_code="def test_x(): pass", attempt_count=1))
         assert result["test_passed"] is True
+        assert result["sandbox_outcome"] == "passed"
         assert result["test_stdout"] == "1 passed"
         assert result["test_stderr"] == ""
 
     def test_sets_passed_false_on_failure(self, mocker):
         mocker.patch(
             "app.agent.nodes.run_test_in_sandbox",
-            return_value=SandboxResult(passed=False, stdout="", stderr="AssertionError", exit_code=1),
+            return_value=SandboxResult(
+                outcome=SandboxOutcome.TEST_FAILED,
+                stdout="",
+                stderr="AssertionError",
+                exit_code=1,
+            ),
         )
         result = run_test_node(_state(test_code="def test_x(): assert False", attempt_count=1))
         assert result["test_passed"] is False
+        assert result["sandbox_outcome"] == "test_failed"
         assert result["test_stderr"] == "AssertionError"
+
+    def test_sets_infrastructure_outcome(self, mocker):
+        mocker.patch(
+            "app.agent.nodes.run_test_in_sandbox",
+            return_value=SandboxResult(
+                outcome=SandboxOutcome.INFRASTRUCTURE_ERROR,
+                stdout="",
+                stderr="Cannot connect to the Docker daemon",
+                exit_code=1,
+            ),
+        )
+
+        result = run_test_node(_state(test_code="def test_x(): pass", attempt_count=1))
+
+        assert result["test_passed"] is False
+        assert result["sandbox_outcome"] == "infrastructure_error"
 
 
 # ── fix_test_node ─────────────────────────────────────────────────────────────
@@ -161,6 +212,16 @@ class TestFinalizeNode:
         result = finalize_node(_state(test_passed=False, attempt_count=3))
         assert result["final_status"] == "failed_max_attempts"
 
+    def test_infrastructure_error_has_distinct_final_status(self):
+        result = finalize_node(
+            _state(
+                test_passed=False,
+                sandbox_outcome="infrastructure_error",
+                attempt_count=1,
+            )
+        )
+        assert result["final_status"] == "infrastructure_error"
+
 
 # ── should_retry ──────────────────────────────────────────────────────────────
 
@@ -177,3 +238,13 @@ class TestShouldRetry:
     def test_returns_finalize_when_attempt_count_exceeds_max(self):
         # Defensive: should not happen in normal flow but must not infinite-loop
         assert should_retry(_state(test_passed=False, attempt_count=5, max_attempts=3)) == "finalize"
+
+    def test_returns_finalize_immediately_for_infrastructure_error(self):
+        assert should_retry(
+            _state(
+                test_passed=False,
+                sandbox_outcome="infrastructure_error",
+                attempt_count=1,
+                max_attempts=3,
+            )
+        ) == "finalize"

@@ -17,19 +17,46 @@ import tempfile
 import os
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 
 
 SANDBOX_IMAGE = "test-agent-sandbox:latest"
 DEFAULT_TIMEOUT_SECONDS = 30
+SANDBOX_STARTED_MARKER = "__TEST_AGENT_SANDBOX_STARTED__"
+
+
+class SandboxOutcome(str, Enum):
+    """Structured outcome of one isolated pytest execution."""
+
+    PASSED = "passed"
+    TEST_FAILED = "test_failed"
+    TIMED_OUT = "timed_out"
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
 
 
 @dataclass
 class SandboxResult:
-    passed: bool
+    outcome: SandboxOutcome
     stdout: str
     stderr: str
     exit_code: int
-    timed_out: bool = False
+
+    @property
+    def passed(self) -> bool:
+        return self.outcome == SandboxOutcome.PASSED
+
+    @property
+    def timed_out(self) -> bool:
+        return self.outcome == SandboxOutcome.TIMED_OUT
+
+
+def _strip_startup_marker(stdout: str) -> tuple[bool, str]:
+    """Return whether the container started and remove its internal marker."""
+    lines = stdout.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.rstrip("\r\n") == SANDBOX_STARTED_MARKER:
+            return True, "".join(lines[:index] + lines[index + 1 :])
+    return False, stdout
 
 
 def build_sandbox_image(sandbox_dir: str) -> None:
@@ -62,7 +89,7 @@ def run_test_in_sandbox(
         timeout_seconds: hard kill limit before the container is stopped.
 
     Returns:
-        SandboxResult with pass/fail, stdout, stderr, and timeout flag.
+        SandboxResult with a structured outcome plus stdout, stderr, and exit code.
     """
     run_id = uuid.uuid4().hex[:8]
 
@@ -89,7 +116,10 @@ def run_test_in_sandbox(
             "-v", f"{mount_path}:/sandbox/work:ro",
             "-w", "/sandbox/work",
             SANDBOX_IMAGE,
-            "pytest", "--tb=short", "-v", "-p", "no:cacheprovider",
+            "sh", "-c",
+            f'printf "{SANDBOX_STARTED_MARKER}\\n"; '
+            'exec pytest --tb=short -v -p no:cacheprovider "$1"',
+            "test-agent-runner",
             f"test_{module_name}.py",
         ]
 
@@ -100,18 +130,36 @@ def run_test_in_sandbox(
                 text=True,
                 timeout=timeout_seconds,
             )
+            container_started, stdout = _strip_startup_marker(result.stdout)
+            if not container_started or result.returncode not in range(0, 6):
+                outcome = SandboxOutcome.INFRASTRUCTURE_ERROR
+            elif result.returncode == 0:
+                outcome = SandboxOutcome.PASSED
+            else:
+                outcome = SandboxOutcome.TEST_FAILED
             return SandboxResult(
-                passed=result.returncode == 0,
-                stdout=result.stdout,
+                outcome=outcome,
+                stdout=stdout,
                 stderr=result.stderr,
                 exit_code=result.returncode,
             )
         except subprocess.TimeoutExpired:
-            subprocess.run(["docker", "kill", container_name], capture_output=True)
+            try:
+                subprocess.run(["docker", "kill", container_name], capture_output=True)
+            except OSError:
+                # The timeout classification remains valid even if the runtime
+                # disappears before the best-effort container cleanup.
+                pass
             return SandboxResult(
-                passed=False,
+                outcome=SandboxOutcome.TIMED_OUT,
                 stdout="",
                 stderr=f"Execution cancelled: exceeded the {timeout_seconds}s limit",
                 exit_code=-1,
-                timed_out=True,
+            )
+        except OSError as exc:
+            return SandboxResult(
+                outcome=SandboxOutcome.INFRASTRUCTURE_ERROR,
+                stdout="",
+                stderr=f"Sandbox runtime could not be started: {exc}",
+                exit_code=-1,
             )

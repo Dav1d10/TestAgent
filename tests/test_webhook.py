@@ -12,7 +12,7 @@ from app.main import app
 import app.webhooks.github_webhook as webhook_module
 from app.webhooks.github_webhook import _extract_python_files, _process_push_event, _safe_module_name
 from app.tools.code_parser import FunctionInfo
-from app.tools.sandbox import SandboxResult
+from app.tools.sandbox import SandboxOutcome, SandboxResult
 
 TEST_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "test-webhook-secret")
 
@@ -227,13 +227,25 @@ def _fn(name):
     )
 
 
-def _final(status, test_code, merged_test_code=None, max_attempts=3):
+def _final(
+    status,
+    test_code,
+    merged_test_code=None,
+    max_attempts=3,
+    attempt_count=3,
+    sandbox_outcome=None,
+    test_stdout="",
+    test_stderr="",
+):
     return {
         "final_status": status,
         "test_code": test_code,
         "merged_test_code": merged_test_code if merged_test_code is not None else test_code,
-        "attempt_count": 3,
+        "attempt_count": attempt_count,
         "max_attempts": max_attempts,
+        "sandbox_outcome": sandbox_outcome,
+        "test_stdout": test_stdout,
+        "test_stderr": test_stderr,
     }
 
 
@@ -295,6 +307,31 @@ class TestProcessPushEvent:
         assert "could not generate a passing test" in body
         assert "appears to have a bug" not in body
 
+    def test_infrastructure_error_posts_distinct_comment_without_pr(self, mocker):
+        create_pr_mock, post_comment_mock = self._mocks(mocker, [_fn("add")])
+        mocker.patch.object(
+            webhook_module._agent,
+            "invoke",
+            return_value=_final(
+                "infrastructure_error",
+                "def test_add_ok(): assert add() is None",
+                max_attempts=3,
+                attempt_count=1,
+                sandbox_outcome="infrastructure_error",
+                test_stderr="Cannot connect to the Docker daemon",
+            ),
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        post_comment_mock.assert_called_once()
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "sandbox infrastructure error" in body
+        assert "not evidence that the generated tests" in body
+        assert "Cannot connect to the Docker daemon" in body
+        assert "could not generate a passing test" not in body
+
     def test_mixed_push_opens_pr_and_posts_comment(self, mocker):
         # add succeeds, is_prime is broken — both in the same module.
         create_pr_mock, post_comment_mock = self._mocks(mocker, [_fn("add"), _fn("is_prime")])
@@ -343,7 +380,7 @@ class TestProcessPushEvent:
         mocker.patch("app.webhooks.github_webhook.extract_modified_functions", return_value=[])
         sandbox = mocker.patch(
             "app.webhooks.github_webhook.run_test_in_sandbox",
-            return_value=SandboxResult(True, "1 passed", "", 0),
+            return_value=SandboxResult(SandboxOutcome.PASSED, "1 passed", "", 0),
         )
         return (
             mocker.patch("app.webhooks.github_webhook.create_pr"),
@@ -482,12 +519,46 @@ class TestProcessPushEvent:
         create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
             mocker, old_source, new_source, baseline, diff_text
         )
-        sandbox.return_value = SandboxResult(False, "1 failed", "", 1)
+        sandbox.return_value = SandboxResult(SandboxOutcome.TEST_FAILED, "1 failed", "", 1)
 
         _process_push_event(PUSH_PAYLOAD, FILES)
 
         create_pr_mock.assert_not_called()
         assert "could not safely remove obsolete tests" in post_comment_mock.call_args.kwargs["body"]
+
+    def test_cleanup_infrastructure_error_is_not_reported_as_test_failure(self, mocker):
+        old_source = "def removed():\n    return 1\n\ndef current():\n    return 2\n"
+        new_source = "def current():\n    return 2\n"
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,5 +1,2 @@
+-def removed():
+-    return 1
+-
+ def current():
+     return 2
+"""
+        baseline = (
+            "from utils import removed\n"
+            "def test_removed():\n    assert removed() == 1\n\n"
+            "def test_unrelated():\n    assert True\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+        sandbox.return_value = SandboxResult(
+            SandboxOutcome.INFRASTRUCTURE_ERROR,
+            "",
+            "Cannot connect to the Docker daemon",
+            1,
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "sandbox infrastructure error" in body
+        assert "could not safely remove obsolete tests" not in body
 
     def test_human_alias_dependency_preserves_file_and_posts_comment(self, mocker):
         old_source = "def removed():\n    return 1\n\ndef current():\n    return 2\n"
@@ -509,7 +580,7 @@ class TestProcessPushEvent:
             mocker, old_source, new_source, baseline, diff_text
         )
         sandbox.return_value = SandboxResult(
-            False,
+            SandboxOutcome.TEST_FAILED,
             "ImportError: cannot import name 'removed'",
             "",
             2,
@@ -552,7 +623,9 @@ class TestProcessPushEvent:
         create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
             mocker, old_source, new_source, baseline, diff_text
         )
-        sandbox.return_value = SandboxResult(False, "collection failed", "", 2)
+        sandbox.return_value = SandboxResult(
+            SandboxOutcome.TEST_FAILED, "collection failed", "", 2
+        )
 
         _process_push_event(PUSH_PAYLOAD, FILES)
 
@@ -580,7 +653,7 @@ class TestProcessPushEvent:
         create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
             mocker, source, source, baseline, diff_text
         )
-        sandbox.return_value = SandboxResult(False, "stale import", "", 2)
+        sandbox.return_value = SandboxResult(SandboxOutcome.TEST_FAILED, "stale import", "", 2)
 
         _process_push_event(PUSH_PAYLOAD, FILES)
 
@@ -609,7 +682,7 @@ class TestProcessPushEvent:
         create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
             mocker, old_source, new_source, baseline, diff_text
         )
-        sandbox.return_value = SandboxResult(True, "1 passed", "", 0)
+        sandbox.return_value = SandboxResult(SandboxOutcome.PASSED, "1 passed", "", 0)
 
         _process_push_event(PUSH_PAYLOAD, FILES)
 
@@ -618,6 +691,37 @@ class TestProcessPushEvent:
         body = post_comment_mock.call_args.kwargs["body"]
         assert "Unchanged-file sandbox validation: PASSED" in body
         assert "Manual review is required" in body
+
+    def test_preserved_dependency_reports_inconclusive_infrastructure(self, mocker):
+        old_source = "def removed():\n    return 1\n"
+        new_source = ""
+        diff_text = """--- a/app/utils.py
++++ b/app/utils.py
+@@ -1,2 +0,0 @@
+-def removed():
+-    return 1
+"""
+        baseline = (
+            "from utils import removed as operation\n\n"
+            "def test_custom_contract():\n    assert operation() == 1\n"
+        )
+        create_pr_mock, post_comment_mock, sandbox = self._deletion_mocks(
+            mocker, old_source, new_source, baseline, diff_text
+        )
+        sandbox.return_value = SandboxResult(
+            SandboxOutcome.INFRASTRUCTURE_ERROR,
+            "",
+            "Cannot connect to the Docker daemon",
+            1,
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        create_pr_mock.assert_not_called()
+        body = post_comment_mock.call_args.kwargs["body"]
+        assert "INCONCLUSIVE — INFRASTRUCTURE ERROR" in body
+        assert "Cannot connect to the Docker daemon" in body
+        assert "Unchanged-file sandbox validation: FAILED" not in body
 
     def test_deleted_source_file_with_human_dependency_is_not_deleted(self, mocker):
         old_source = "def removed():\n    return 1\n"
@@ -640,7 +744,7 @@ class TestProcessPushEvent:
         post_comment_mock = mocker.patch("app.webhooks.github_webhook.post_commit_comment")
         sandbox = mocker.patch(
             "app.webhooks.github_webhook.run_test_in_sandbox",
-            return_value=SandboxResult(False, "ImportError", "", 2),
+            return_value=SandboxResult(SandboxOutcome.TEST_FAILED, "ImportError", "", 2),
         )
         deleted_files = [
             {

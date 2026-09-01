@@ -7,7 +7,7 @@ from openai import OpenAI
 
 from app.agent.state import AgentState
 from app.agent.prompts import build_generate_test_prompt, build_fix_test_prompt
-from app.tools.sandbox import run_test_in_sandbox
+from app.tools.sandbox import SandboxOutcome, run_test_in_sandbox
 from app.tools.test_merger import merge_test_block, top_level_function_names
 
 client = OpenAI()
@@ -89,6 +89,7 @@ def run_test_node(state: AgentState) -> dict:
 
     return {
         "test_passed": result.passed,
+        "sandbox_outcome": result.outcome.value,
         "test_stdout": result.stdout,
         "test_stderr": result.stderr,
     }
@@ -122,6 +123,8 @@ def fix_test_node(state: AgentState) -> dict:
 
 def finalize_node(state: AgentState) -> dict:
     """Terminal node: records the final outcome of the cycle."""
+    if state.get("sandbox_outcome") == SandboxOutcome.INFRASTRUCTURE_ERROR.value:
+        return {"final_status": "infrastructure_error"}
     if state["test_passed"]:
         return {"final_status": "success"}
     return {"final_status": "failed_max_attempts"}
@@ -135,6 +138,8 @@ def should_retry(state: AgentState) -> str:
     Returns the name of the next node: "fix_test" or "finalize".
     """
     if state["test_passed"]:
+        return "finalize"
+    if state.get("sandbox_outcome") == SandboxOutcome.INFRASTRUCTURE_ERROR.value:
         return "finalize"
     if state["attempt_count"] >= state["max_attempts"]:
         return "finalize"

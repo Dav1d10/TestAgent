@@ -21,7 +21,8 @@ def build_agent_graph():
 
     Flow:
         generate_test -> run_test -> [decision]
-                                         |-- passed or max attempts reached --> finalize
+                                         |-- passed, infrastructure error,
+                                         |   or max attempts reached -------> finalize
                                          |-- failed, attempts remain --> fix_test -> run_test (loop)
     """
     graph = StateGraph(AgentState)

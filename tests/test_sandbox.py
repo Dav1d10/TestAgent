@@ -1,5 +1,5 @@
 import pytest
-from app.tools.sandbox import run_test_in_sandbox
+from app.tools.sandbox import SandboxOutcome, run_test_in_sandbox
 
 pytestmark = pytest.mark.docker
 
@@ -58,12 +58,14 @@ def test_network():
 def test_passing_test_returns_passed_true():
     result = run_test_in_sandbox(PASSING_SOURCE, PASSING_TEST, module_name="target_module")
     assert result.passed is True
+    assert result.outcome == SandboxOutcome.PASSED
     assert result.exit_code == 0
 
 
 def test_failing_assertion_returns_passed_false():
     result = run_test_in_sandbox(PASSING_SOURCE, FAILING_TEST, module_name="target_module")
     assert result.passed is False
+    assert result.outcome == SandboxOutcome.TEST_FAILED
     assert result.exit_code != 0
 
 
@@ -75,9 +77,11 @@ def test_timeout_kills_container():
         timeout_seconds=4,
     )
     assert result.timed_out is True
+    assert result.outcome == SandboxOutcome.TIMED_OUT
     assert result.passed is False
 
 
 def test_network_access_is_blocked():
     result = run_test_in_sandbox(NETWORK_SOURCE, NETWORK_TEST, module_name="target_module")
     assert result.passed is False
+    assert result.outcome == SandboxOutcome.TEST_FAILED
