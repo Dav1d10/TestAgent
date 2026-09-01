@@ -184,7 +184,8 @@ def create_pr(
             if existing.status_code == 404:
                 continue
             existing.raise_for_status()
-            delete_resp = client.delete(
+            delete_resp = client.request(
+                "DELETE",
                 f"{_API}/repos/{repo}/contents/{path}",
                 headers=headers,
                 json={

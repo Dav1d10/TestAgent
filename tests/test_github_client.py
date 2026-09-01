@@ -159,7 +159,10 @@ class TestCreatePr:
         assert put_call.kwargs["json"]["sha"] == "existing_blob_sha"
 
     def test_deletes_existing_file_on_branch(self, mocker):
-        mock_client = mocker.MagicMock()
+        # Autospec enforces httpx's real method signatures. A plain MagicMock
+        # previously accepted client.delete(json=...), hiding that httpx 0.27
+        # does not allow a JSON body through the delete convenience method.
+        mock_client = mocker.create_autospec(httpx.Client, instance=True)
 
         def get_side_effect(url, **kwargs):
             if url.endswith("/repos/owner/repo"):
@@ -175,7 +178,7 @@ class TestCreatePr:
             _FakeResponse(),
             _FakeResponse(json_data={"html_url": "https://github.com/owner/repo/pull/3"}),
         ]
-        mock_client.delete.return_value = _FakeResponse()
+        mock_client.request.return_value = _FakeResponse()
         mocker.patch("httpx.Client").return_value.__enter__.return_value = mock_client
 
         github_client.create_pr(
@@ -188,10 +191,12 @@ class TestCreatePr:
             deleted_files=["tests/test_x.py"],
         )
 
-        delete_call = mock_client.delete.call_args
-        assert "contents/tests/test_x.py" in delete_call.args[0]
+        delete_call = mock_client.request.call_args
+        assert delete_call.args[0] == "DELETE"
+        assert "contents/tests/test_x.py" in delete_call.args[1]
         assert delete_call.kwargs["json"] == {
             "message": "Remove obsolete generated test file tests/test_x.py",
             "sha": "obsolete_blob_sha",
             "branch": "test-agent/push/abc1234",
         }
+        mock_client.delete.assert_not_called()
