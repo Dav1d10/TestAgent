@@ -31,6 +31,12 @@ from app.tools.github_client import (
     get_push_diff,
     post_commit_comment,
 )
+from app.tools.pr_description import (
+    PullRequestAction,
+    PullRequestChange,
+    build_pull_request_body,
+    build_pull_request_title,
+)
 from app.tools.sandbox import SandboxOutcome, run_test_in_sandbox
 from app.tools.test_merger import (
     PreservedTestDependency,
@@ -239,6 +245,7 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
 
     pr_files: List[Tuple[str, str]] = []   # (test_path, merged content) — only green tests
     deleted_test_files: List[str] = []     # module test files removed when no tests can remain
+    pr_changes: List[PullRequestChange] = []  # factual metadata for the published PR
     broken_comments: List[str] = []        # one commit-comment body per failed function
 
     for patched_file in patch_set:
@@ -298,6 +305,14 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
 
             if test_path not in deleted_test_files:
                 deleted_test_files.append(test_path)
+                pr_changes.append(
+                    PullRequestChange(
+                        action=PullRequestAction.DELETED,
+                        test_path=test_path,
+                        functions=tuple(deleted_names),
+                        reason="Source module was deleted",
+                    )
+                )
             continue
 
         try:
@@ -392,6 +407,7 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
         cleanup_changed = accumulated != original_test_file
         module_has_pr_change = False
         delete_test_file_if_no_success = False
+        successful_generation_changes: List[PullRequestChange] = []
 
         if cleanup_changed:
             if contains_test_cases(accumulated):
@@ -466,6 +482,22 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
                 accumulated = final_state["merged_test_code"]
                 module_has_pr_change = True
                 delete_test_file_if_no_success = False
+                successful_generation_changes.append(
+                    PullRequestChange(
+                        action=(
+                            PullRequestAction.UPDATED
+                            if original_test_file.strip()
+                            else PullRequestAction.CREATED
+                        ),
+                        test_path=test_path,
+                        functions=(fn.name,),
+                        reason=(
+                            "Source function was modified"
+                            if fn.name in old_function_names
+                            else "New source function was added"
+                        ),
+                    )
+                )
             elif final_state["final_status"] == "infrastructure_error":
                 output = "\n".join(
                     part.strip()
@@ -496,19 +528,67 @@ def _process_push_event(payload: Dict[str, Any], files: List[Dict[str, Any]]) ->
         if module_has_pr_change:
             if contains_test_cases(accumulated):
                 pr_files.append((test_path, accumulated))
+                if cleanup_changed:
+                    directly_deleted = [
+                        name for name in cleanup_names if name in deleted_function_names
+                    ]
+                    reconciled_orphans = [
+                        name for name in cleanup_names if name not in deleted_function_names
+                    ]
+                    if directly_deleted:
+                        pr_changes.append(
+                            PullRequestChange(
+                                action=PullRequestAction.CLEANED,
+                                test_path=test_path,
+                                functions=tuple(directly_deleted),
+                                reason="Source function no longer exists",
+                            )
+                        )
+                    if reconciled_orphans:
+                        pr_changes.append(
+                            PullRequestChange(
+                                action=PullRequestAction.CLEANED,
+                                test_path=test_path,
+                                functions=tuple(reconciled_orphans),
+                                reason="Orphaned tests found during reconciliation",
+                            )
+                        )
+                pr_changes.extend(successful_generation_changes)
             elif delete_test_file_if_no_success and test_path not in deleted_test_files:
                 deleted_test_files.append(test_path)
+                directly_deleted = [
+                    name for name in cleanup_names if name in deleted_function_names
+                ]
+                reconciled_orphans = [
+                    name for name in cleanup_names if name not in deleted_function_names
+                ]
+                if directly_deleted:
+                    pr_changes.append(
+                        PullRequestChange(
+                            action=PullRequestAction.DELETED,
+                            test_path=test_path,
+                            functions=tuple(directly_deleted),
+                            reason="No testable source functions remain",
+                        )
+                    )
+                if reconciled_orphans:
+                    pr_changes.append(
+                        PullRequestChange(
+                            action=PullRequestAction.DELETED,
+                            test_path=test_path,
+                            functions=tuple(reconciled_orphans),
+                            reason="All remaining tests were orphaned",
+                        )
+                    )
 
     if pr_files or deleted_test_files:
         branch = f"test-agent/push/{head[:7]}"
-        changed_paths = [p for p, _ in pr_files] + deleted_test_files
-        modules = ", ".join(p.split("/")[-1] for p in changed_paths)
         try:
             pr_url = create_pr(
                 repo=repo,
                 branch=branch,
-                title=f"TestAgent: tests for push {head[:7]}",
-                body=f"Auto-generated/updated tests for: {modules}",
+                title=build_pull_request_title(pr_changes, head),
+                body=build_pull_request_body(pr_changes, head),
                 files=pr_files,
                 token=GITHUB_TOKEN,
                 deleted_files=deleted_test_files,

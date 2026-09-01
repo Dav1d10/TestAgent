@@ -253,8 +253,11 @@ class TestProcessPushEvent:
     def _mocks(self, mocker, functions):
         mocker.patch("app.webhooks.github_webhook.get_push_diff", return_value=UTILS_DIFF)
         mocker.patch("app.webhooks.github_webhook.get_file_content", return_value="def add(): pass\n")
-        # No existing module test file (baseline is empty).
-        mocker.patch("app.webhooks.github_webhook.get_file_content_or_empty", return_value="")
+        # The source existed at base, but no module test file exists at head.
+        mocker.patch(
+            "app.webhooks.github_webhook.get_file_content_or_empty",
+            side_effect=["def add(): pass\n", ""],
+        )
         mocker.patch("app.webhooks.github_webhook.extract_modified_functions", return_value=functions)
         return (
             mocker.patch("app.webhooks.github_webhook.create_pr"),
@@ -277,7 +280,46 @@ class TestProcessPushEvent:
         assert create_pr_mock.call_args.kwargs["files"] == [
             ("tests/test_utils.py", "def test_add_ok():\n    assert add() is None\n")
         ]
+        assert create_pr_mock.call_args.kwargs["title"] == (
+            "TestAgent: add tests for push abc123"
+        )
+        body = create_pr_mock.call_args.kwargs["body"]
+        assert "| Created | `tests/test_utils.py` | `add` | Source function was modified |" in body
+        assert "## Validation" not in body
         post_comment_mock.assert_not_called()
+
+    def test_success_updates_existing_test_file_description(self, mocker):
+        mocker.patch("app.webhooks.github_webhook.get_push_diff", return_value=UTILS_DIFF)
+        mocker.patch("app.webhooks.github_webhook.get_file_content", return_value="def add(): pass\n")
+        baseline = "def test_existing():\n    assert True\n"
+        mocker.patch(
+            "app.webhooks.github_webhook.get_file_content_or_empty",
+            side_effect=["def add(): pass\n", baseline],
+        )
+        mocker.patch(
+            "app.webhooks.github_webhook.extract_modified_functions",
+            return_value=[_fn("add")],
+        )
+        create_pr_mock = mocker.patch("app.webhooks.github_webhook.create_pr")
+        mocker.patch("app.webhooks.github_webhook.post_commit_comment")
+        mocker.patch.object(
+            webhook_module._agent,
+            "invoke",
+            return_value=_final(
+                "success",
+                "def test_add_ok(): assert add() is None",
+                merged_test_code=baseline + "\ndef test_add_ok():\n    assert add() is None\n",
+            ),
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        assert create_pr_mock.call_args.kwargs["title"] == (
+            "TestAgent: update tests for push abc123"
+        )
+        assert "| Updated | `tests/test_utils.py` | `add` | Source function was modified |" in (
+            create_pr_mock.call_args.kwargs["body"]
+        )
 
     def test_broken_function_posts_bug_comment_not_pr(self, mocker):
         create_pr_mock, post_comment_mock = self._mocks(mocker, [_fn("add")])
@@ -359,6 +401,7 @@ class TestProcessPushEvent:
         # ...and the broken function gets its own commit comment.
         post_comment_mock.assert_called_once()
         assert "is_prime" in post_comment_mock.call_args.kwargs["body"]
+        assert "is_prime" not in create_pr_mock.call_args.kwargs["body"]
 
     def test_no_modified_functions_does_nothing(self, mocker):
         create_pr_mock, post_comment_mock = self._mocks(mocker, [])
@@ -419,6 +462,12 @@ class TestProcessPushEvent:
         assert "removed" not in cleaned
         assert "test_current_basic" in cleaned
         assert create_pr_mock.call_args.kwargs["deleted_files"] == []
+        assert create_pr_mock.call_args.kwargs["title"] == (
+            "TestAgent: remove obsolete tests for push abc123"
+        )
+        assert "| Cleaned | `tests/test_utils.py` | `removed` | Source function no longer exists |" in (
+            create_pr_mock.call_args.kwargs["body"]
+        )
         post_comment_mock.assert_not_called()
 
     def test_reconciles_orphan_left_by_missed_deletion_webhook(self, mocker):
@@ -445,6 +494,12 @@ class TestProcessPushEvent:
         cleaned = create_pr_mock.call_args.kwargs["files"][0][1]
         assert "removed" not in cleaned
         assert "test_current_basic" in cleaned
+        assert create_pr_mock.call_args.kwargs["title"] == (
+            "TestAgent: remove obsolete tests for push abc123"
+        )
+        assert "Orphaned tests found during reconciliation" in (
+            create_pr_mock.call_args.kwargs["body"]
+        )
 
     def test_deleting_last_owned_tests_deletes_test_file(self, mocker):
         old_source = "def removed():\n    return 1\n"
@@ -465,6 +520,33 @@ class TestProcessPushEvent:
         sandbox.assert_not_called()
         assert create_pr_mock.call_args.kwargs["files"] == []
         assert create_pr_mock.call_args.kwargs["deleted_files"] == ["tests/test_utils.py"]
+        assert create_pr_mock.call_args.kwargs["title"] == (
+            "TestAgent: delete obsolete test file for push abc123"
+        )
+        assert "No testable source functions remain" in create_pr_mock.call_args.kwargs["body"]
+
+    def test_reconciled_last_orphan_deletes_test_file_with_reason(self, mocker):
+        source = '"""Functionless module touched after a missed webhook."""\n'
+        diff_text = '''--- a/app/utils.py
++++ b/app/utils.py
+@@ -1 +1 @@
+-"""Old module description."""
++"""Functionless module touched after a missed webhook."""
+'''
+        baseline = (
+            "from utils import removed\n\n"
+            "def test_removed_basic():\n    assert removed() == 1\n"
+        )
+        create_pr_mock, _, sandbox = self._deletion_mocks(
+            mocker, source, source, baseline, diff_text
+        )
+
+        _process_push_event(PUSH_PAYLOAD, FILES)
+
+        sandbox.assert_not_called()
+        assert create_pr_mock.call_args.kwargs["deleted_files"] == ["tests/test_utils.py"]
+        body = create_pr_mock.call_args.kwargs["body"]
+        assert "| Deleted | `tests/test_utils.py` | `removed` | All remaining tests were orphaned |" in body
 
     def test_deleted_source_file_deletes_module_test_file(self, mocker):
         diff_text = """--- a/app/utils.py
@@ -498,6 +580,10 @@ class TestProcessPushEvent:
         get_content.assert_not_called()
         assert create_pr_mock.call_args.kwargs["files"] == []
         assert create_pr_mock.call_args.kwargs["deleted_files"] == ["tests/test_utils.py"]
+        assert create_pr_mock.call_args.kwargs["title"] == (
+            "TestAgent: delete obsolete test file for push abc123"
+        )
+        assert "Source module was deleted" in create_pr_mock.call_args.kwargs["body"]
 
     def test_cleanup_validation_failure_posts_specific_comment(self, mocker):
         old_source = "def removed():\n    return 1\n\ndef current():\n    return 2\n"
@@ -812,4 +898,11 @@ class TestProcessPushEvent:
         assert "old_name" not in content
         assert "test_new_name_basic" in content
         assert create_pr_mock.call_args.kwargs["deleted_files"] == []
+        assert create_pr_mock.call_args.kwargs["title"] == (
+            "TestAgent: reconcile tests for push abc123"
+        )
+        body = create_pr_mock.call_args.kwargs["body"]
+        assert "| Cleaned | `tests/test_utils.py` | `old_name` |" in body
+        assert "| Updated | `tests/test_utils.py` | `new_name` |" in body
+        assert "New source function was added" in body
         post_comment_mock.assert_not_called()
