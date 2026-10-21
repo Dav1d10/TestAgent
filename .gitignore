@@ -14,6 +14,9 @@ __pycache__/
 # Docker
 *.log
 
+# macOS
+.DS_Store
+
 # IDE
 .vscode/
 .idea/
