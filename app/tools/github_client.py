@@ -4,7 +4,7 @@ GitHub API client.
 Stage 3: get_file_content — fetches a file's source at a specific commit ref.
 Stage 4: get_push_diff, create_pr, post_commit_comment. All push-triggered — this
 project has not added `pull_request` event handling to the webhook, so PR-diff and
-PR-comment functions are out of scope here (see ImplementationPlan.md Stage 4 revision).
+PR-comment functions are out of scope here (see docs/ImplementationPlan.md Stage 4).
 """
 
 import base64

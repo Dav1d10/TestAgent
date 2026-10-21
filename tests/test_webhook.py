@@ -102,7 +102,7 @@ def test_push_without_python_files_returns_no_files():
     payload = {
         "repository": {"full_name": "user/repo"},
         "after": "abc123",
-        "commits": [{"modified": ["README.md", "docs/guide.rst"], "added": []}],
+        "commits": [{"modified": ["README.md", "requirements.txt"], "added": []}],
     }
     response = _post(payload)
     assert response.json()["status"] == "no_python_files"

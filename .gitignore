@@ -20,6 +20,5 @@ __pycache__/
 
 CLAUDE.md
 AGENTS.md
-ImplementationPlan.md
+docs/
 /.agents/skills/
-TestRepo.md
