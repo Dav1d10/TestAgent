@@ -95,6 +95,24 @@ class TestGenerateTestNode:
         _, user_prompt = llm_call.call_args[0]
         assert "ONLY for" not in user_prompt
 
+    @pytest.mark.parametrize("target_function", [None, "add"])
+    def test_generation_prompt_anchors_expectations_to_explicit_contract(
+        self, mocker, target_function
+    ):
+        llm_call = mocker.patch(
+            "app.agent.nodes._call_llm",
+            return_value="def test_add(): pass",
+        )
+
+        generate_test_node(_state(target_function=target_function))
+
+        system_prompt, _ = llm_call.call_args[0]
+        normalized = " ".join(system_prompt.split())
+        assert "explicit public contract first" in normalized
+        assert "do not use it as the expected-value oracle" in normalized
+        assert "assert the documented behavior and allow the test to fail" in normalized
+        assert "Do not add a `# BUG:` diagnosis during initial generation" in normalized
+
 
 # ── run_test_node ─────────────────────────────────────────────────────────────
 

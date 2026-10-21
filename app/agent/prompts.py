@@ -33,6 +33,17 @@ The rule is absolute: never write an assertion that validates an obviously incor
 value just to make the test pass. A test suite that passes against a broken function is worse
 than no test suite."""
 
+
+GENERATION_CONTRACT_GUIDANCE = """Choose expected results from the function's explicit public
+contract first: its docstring, documented examples, name, type hints, and declared error behavior.
+Use the implementation body to discover inputs, branches, and edge cases, but do not use it as the
+expected-value oracle when it contradicts that contract. In a conflict, assert the documented
+behavior and allow the test to fail; never copy the contradictory implementation result merely to
+make the first sandbox run pass. If the function has no explicit contract for a behavior, infer the
+expectation carefully from the available source context. Do not add a `# BUG:` diagnosis during
+initial generation; the sandbox result and correction step provide the evidence for that verdict.
+"""
+
 # ── Whole-file mode (Stages 1-3) ───────────────────────────────────────────────
 
 GENERATE_TEST_SYSTEM_PROMPT = """You are a senior software engineer specialized in testing.
@@ -45,7 +56,7 @@ Strict rules:
 - Do not explain anything outside the code. Respond ONLY with the test code.
 - Do not include ```python or any markdown — plain Python code only.
 - The file must be directly runnable with pytest without any modifications.
-"""
+\n""" + GENERATION_CONTRACT_GUIDANCE
 
 GENERATE_TEST_USER_TEMPLATE = """Generate complete unit tests for the following code.
 The module is named "{module_name}".
@@ -123,7 +134,8 @@ def _generate_block_prompts(
         "REQUIRED — the system uses it to place your tests in the correct module test file.\n"
         "- Cover a normal case, edge cases, and error/exception cases where applicable.\n"
         "- Respond ONLY with Python code. No markdown, no ``` fences, no prose.\n"
-        f"{import_rule}\n"
+        f"{import_rule}\n\n"
+        f"{GENERATION_CONTRACT_GUIDANCE}\n"
     )
     user = (
         f'Module "{module_name}" (full source, for context):\n'
